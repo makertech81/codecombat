@@ -1,19 +1,26 @@
+require('app/styles/editor/patch.sass')
 ModalView = require 'views/core/ModalView'
 template = require 'templates/editor/patch_modal'
 DeltaView = require 'views/editor/DeltaView'
 auth = require 'core/auth'
 deltasLib = require 'core/deltas'
+modelDeltas = require 'lib/modelDeltas'
 
 module.exports = class PatchModal extends ModalView
   id: 'patch-modal'
   template: template
   plain: true
   modalWidthPercent: 60
+  instant: true
 
   events:
     'click #withdraw-button': 'withdrawPatch'
     'click #reject-button': 'rejectPatch'
     'click #accept-button': 'acceptPatch'
+
+  shortcuts:
+    'a, shift+a': 'acceptPatch'
+    'r': 'rejectPatch'
 
   constructor: (@patch, @targetModel, options) ->
     super(options)
@@ -22,7 +29,7 @@ module.exports = class PatchModal extends ModalView
       @originalSource = @targetModel.clone(false)
     else
       @originalSource = new @targetModel.constructor({_id:targetID})
-      @supermodel.loadModel @originalSource, 'source_document'
+      @supermodel.loadModel @originalSource
 
   applyDelta: ->
     @headModel = null
@@ -34,7 +41,7 @@ module.exports = class PatchModal extends ModalView
 
     @pendingModel = @originalSource.clone(false)
     @pendingModel.markToRevert true
-    @deltaWorked = @pendingModel.applyDelta(@patch.get('delta'))
+    @deltaWorked = modelDeltas.applyDelta(@pendingModel, @patch.get('delta'))
     @pendingModel.loaded = true
 
   render: ->
@@ -59,7 +66,7 @@ module.exports = class PatchModal extends ModalView
 
   acceptPatch: ->
     delta = @deltaView.getApplicableDelta()
-    @targetModel.applyDelta(delta)
+    modelDeltas.applyDelta(@targetModel, delta)
     @targetModel.saveBackupNow()
     @patch.setStatus('accepted')
     @trigger 'accepted-patch'

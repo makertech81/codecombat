@@ -1,5 +1,6 @@
+require('app/styles/play/level/level-playback-view.sass')
 CocoView = require 'views/core/CocoView'
-template = require 'templates/play/level/playback'
+template = require 'templates/play/level/level-playback-view'
 {me} = require 'core/auth'
 
 module.exports = class LevelPlaybackView extends CocoView
@@ -20,8 +21,9 @@ module.exports = class LevelPlaybackView extends CocoView
     'level:set-letterbox': 'onSetLetterbox'
     'tome:cast-spells': 'onTomeCast'
     'playback:real-time-playback-ended': 'onRealTimePlaybackEnded'
+    'playback:cinematic-playback-ended': 'onCinematicPlaybackEnded'
     'playback:stop-real-time-playback': 'onStopRealTimePlayback'
-    'real-time-multiplayer:manual-cast': 'onRealTimeMultiplayerCast'
+    'playback:stop-cinematic-playback': 'onStopCinematicPlayback'
 
   events:
     'click #music-button': 'onToggleMusic'
@@ -51,7 +53,7 @@ module.exports = class LevelPlaybackView extends CocoView
   afterRender: ->
     super()
     @$progressScrubber = $('.scrubber .progress', @$el)
-    @hookUpScrubber()
+    @hookUpScrubber() unless @options.level.isType('game-dev')
     @updateMusicButton()
     $(window).on('resize', @onWindowResize)
     ua = navigator.userAgent.toLowerCase()
@@ -95,7 +97,7 @@ module.exports = class LevelPlaybackView extends CocoView
     @$el.find('#music-button').toggleClass('music-on', me.get('music'))
 
   onSetLetterbox: (e) ->
-    return if @realTime
+    return if @realTime or @cinematic
     @togglePlaybackControls !e.on
     @disabled = e.on
 
@@ -104,17 +106,14 @@ module.exports = class LevelPlaybackView extends CocoView
     buttons.css 'visibility', if to then 'visible' else 'hidden'
 
   onTomeCast: (e) ->
-    return unless e.realTime
-    @realTime = true
-    @togglePlaybackControls false
-    Backbone.Mediator.publish 'playback:real-time-playback-started', {}
-    Backbone.Mediator.publish 'audio-player:play-sound', trigger: 'real-time-playback-start', volume: 1
-    Backbone.Mediator.publish 'level:set-letterbox', on: true if @options.level.get('type', true) is ['hero']  # not with flags...?
-
-  onRealTimeMultiplayerCast: (e) ->
-    @realTime = true
-    @togglePlaybackControls false
-    Backbone.Mediator.publish 'playback:real-time-playback-waiting', {}
+    if e.realTime
+      @realTime = true
+      @togglePlaybackControls false
+      Backbone.Mediator.publish 'playback:real-time-playback-started', {}
+      @playSound 'real-time-playback-start'
+    else if e.cinematic
+      @cinematic = true
+      Backbone.Mediator.publish 'playback:cinematic-playback-started', {}
 
   onWindowResize: (s...) =>
     @barWidth = $('.progress', @$el).width()
@@ -144,7 +143,7 @@ module.exports = class LevelPlaybackView extends CocoView
       @$el.addClass 'controls-disabled'
 
   onEnableControls: (e) ->
-    return if @realTime
+    return if @realTime or @cinematic
     if not e.controls or ('playback' in e.controls)
       @disabled = false
       $('button', @$el).removeClass('disabled')
@@ -161,7 +160,7 @@ module.exports = class LevelPlaybackView extends CocoView
     ended = button.hasClass 'ended'
     changed = button.hasClass('playing') isnt @playing
     button.toggleClass('playing', @playing and not ended).toggleClass('paused', not @playing and not ended)
-    Backbone.Mediator.publish 'audio-player:play-sound', trigger: (if @playing then 'playback-play' else 'playback-pause'), volume: 1
+    @playSound (if @playing then 'playback-play' else 'playback-pause') unless @options.level.isType('game-dev')
     return   # don't stripe the bar
     bar = @$el.find '.scrubber .progress'
     bar.toggleClass('progress-striped', @playing and not ended).toggleClass('active', @playing and not ended)
@@ -254,8 +253,9 @@ module.exports = class LevelPlaybackView extends CocoView
     wasEnded = playButton.hasClass('ended')
     if @worldCompletelyLoaded and progress >= 0.99 and @lastProgress < 0.99
       playButton.removeClass('playing').removeClass('paused').addClass('ended')
-      Backbone.Mediator.publish 'level:set-letterbox', on: false if @realTime
+      Backbone.Mediator.publish 'level:set-letterbox', on: false if @realTime or @cinematic
       Backbone.Mediator.publish 'playback:real-time-playback-ended', {} if @realTime
+      Backbone.Mediator.publish 'playback:cinematic-playback-ended', {} if @cinematic
     if progress < 0.99 and @lastProgress >= 0.99
       playButton.removeClass('ended')
       playButton.addClass(if @playing then 'playing' else 'paused')
@@ -267,11 +267,20 @@ module.exports = class LevelPlaybackView extends CocoView
     return unless @realTime
     @realTime = false
     @togglePlaybackControls true
-    Backbone.Mediator.publish 'audio-player:play-sound', trigger: 'real-time-playback-end', volume: 1
+    @playSound 'real-time-playback-end'
+
+  onCinematicPlaybackEnded: (e) ->
+    @cinematic = false
+    @togglePlaybackControls true
 
   onStopRealTimePlayback: (e) ->
     Backbone.Mediator.publish 'level:set-letterbox', on: false
     Backbone.Mediator.publish 'playback:real-time-playback-ended', {}
+
+  onStopCinematicPlayback: (e) ->
+    return unless @cinematic
+    Backbone.Mediator.publish 'level:set-letterbox', on: false
+    Backbone.Mediator.publish 'playback:cinematic-playback-ended', {}
 
   # to refactor
 
@@ -287,14 +296,15 @@ module.exports = class LevelPlaybackView extends CocoView
         @scrubTo ui.value / @sliderIncrements
         if ratioChange = @getScrubRatio() - oldRatio
           sound = "playback-scrub-slide-#{if ratioChange > 0 then 'forward' else 'back'}-#{@slideCount % 3}"
-          Backbone.Mediator.publish 'audio-player:play-sound', trigger: sound, volume: Math.min 1, Math.abs ratioChange * 50
+          unless /back/.test sound  # We don't have the back sounds in yet: http://discourse.codecombat.com/t/bug-some-mp3-lost/4830
+            @playSound sound, (Math.min 1, Math.abs ratioChange * 50)
 
       start: (event, ui) =>
         return if @shouldIgnore()
         @slideCount = 0
         @wasPlaying = @playing and not $('#play-button').hasClass('ended')
         Backbone.Mediator.publish 'level:set-playing', {playing: false}
-        Backbone.Mediator.publish 'audio-player:play-sound', trigger: 'playback-scrub-start', volume: 0.5
+        @playSound 'playback-scrub-start', 0.5
 
 
       stop: (event, ui) =>
@@ -305,9 +315,9 @@ module.exports = class LevelPlaybackView extends CocoView
         if @slideCount < 3
           @wasPlaying = false
           Backbone.Mediator.publish 'level:set-playing', {playing: false}
-          @$el.find('.scrubber-handle').effect('bounce', {times: 2})
+          @$el.find('.scrubber-handle').effect('bounce', {times: 2}) # TODO: Performance: consider removing, this is the only use
         else
-          Backbone.Mediator.publish 'audio-player:play-sound', trigger: 'playback-scrub-end', volume: 0.5
+          @playSound 'playback-scrub-end', 0.5
 
     )
 

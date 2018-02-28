@@ -6,17 +6,12 @@ module.exports = class SaveCampaignModal extends ModalView
   id: 'save-campaign-modal'
   template: template
   plain: true
-  
+
   events:
     'click #save-button': 'onClickSaveButton'
 
   constructor: (options, @modelsToSave) ->
     super(options)
-    
-  getRenderData: ->
-    c = super()
-    c.modelsToSave = @modelsToSave
-    c
 
   afterRender: ->
     @$el.find('.delta-view').each((i, el) =>
@@ -26,9 +21,8 @@ module.exports = class SaveCampaignModal extends ModalView
       @insertSubView(deltaView, $el)
     )
     super()
-    
+
   onClickSaveButton: ->
     @showLoading()
     modelsBeingSaved = (model.patch() for model in @modelsToSave.models)
-    modelsBeingSaved = modelsBeingSaved
     $.when(_.compact(modelsBeingSaved)...).done(-> document.location.reload())

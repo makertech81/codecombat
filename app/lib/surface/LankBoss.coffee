@@ -1,8 +1,6 @@
 CocoClass = require 'core/CocoClass'
 {me} = require 'core/auth'
 LayerAdapter = require './LayerAdapter'
-IndieLank = require 'lib/surface/IndieLank'
-WizardLank = require 'lib/surface/WizardLank'
 FlagLank = require 'lib/surface/FlagLank'
 Lank = require 'lib/surface/Lank'
 Mark = require './Mark'
@@ -11,8 +9,6 @@ utils = require 'core/utils'
 
 module.exports = class LankBoss extends CocoClass
   subscriptions:
-    'bus:player-joined': 'onPlayerJoined'
-    'bus:player-left': 'onPlayerLeft'
     'level:set-debug': 'onSetDebug'
     'sprite:highlight-sprites': 'onHighlightSprites'
     'surface:stage-mouse-down': 'onStageMouseDown'
@@ -29,10 +25,11 @@ module.exports = class LankBoss extends CocoClass
     'surface:flag-appeared': 'onFlagAppeared'
     'surface:remove-selected-flag': 'onRemoveSelectedFlag'
 
-  constructor: (@options) ->
+  constructor: (@options={}) ->
     super()
+    @handleEvents = @options.handleEvents
+    @gameUIState = @options.gameUIState
     @dragged = 0
-    @options ?= {}
     @camera = @options.camera
     @webGLStage = @options.webGLStage
     @surfaceTextLayer = @options.surfaceTextLayer
@@ -40,9 +37,10 @@ module.exports = class LankBoss extends CocoClass
     @options.thangTypes ?= []
     @lanks = {}
     @lankArray = []  # Mirror @lanks, but faster for when we just need to iterate
-    @selfWizardLank = null
     @createLayers()
     @pendingFlags = []
+    if not @handleEvents
+      @listenTo @gameUIState, 'change:selected', @onChangeSelected
 
   destroy: ->
     @removeLank lank for thangID, lank of @lanks
@@ -87,7 +85,7 @@ module.exports = class LankBoss extends CocoClass
     console.error 'Lank collision! Already have:', id if @lanks[id]
     @lanks[id] = lank
     @lankArray.push lank
-    layer ?= @layerAdapters['Obstacle'] if lank.thang?.spriteName.search(/(dungeon|indoor).wall/i) isnt -1
+    layer ?= @layerAdapters['Obstacle'] if lank.thang?.spriteName.search(/(dungeon|indoor|ice|classroom|vr).wall/i) isnt -1
     layer ?= @layerForChild lank.sprite, lank
     layer.addLank lank
     layer.updateLayerOrder()
@@ -98,50 +96,16 @@ module.exports = class LankBoss extends CocoClass
     @selectionMark = new Mark name: 'selection', camera: @camera, layer: @layerAdapters['Ground'], thangType: 'selection'
 
   createLankOptions: (options) ->
-    _.extend options, camera: @camera, resolutionFactor: SPRITE_RESOLUTION_FACTOR, groundLayer: @layerAdapters['Ground'], textLayer: @surfaceTextLayer, floatingLayer: @layerAdapters['Floating'], showInvisible: @options.showInvisible
-
-  createIndieLanks: (indieLanks, withWizards) ->
-    unless @indieLanks
-      @indieLanks = []
-      @indieLanks = (@createIndieLank indieLank for indieLank in indieLanks) if indieLanks
-    if withWizards and not @selfWizardLank
-      @selfWizardLank = @createWizardLank thangID: 'My Wizard', isSelf: true, lanks: @lanks
-
-  createIndieLank: (indieLank) ->
-    unless thangType = @thangTypeFor indieLank.thangType
-      console.warn "Need to convert #{indieLank.id}'s ThangType #{indieLank.thangType} to a ThangType reference. Until then, #{indieLank.id} won't show up."
-      return
-    lank = new IndieLank thangType, @createLankOptions {thangID: indieLank.id, pos: indieLank.pos, lanks: @lanks, team: indieLank.team, teamColors: @world.getTeamColors()}
-    @addLank lank, lank.thang.id
-
-  createOpponentWizard: (opponent) ->
-    # TODO: colorize name and cloud by team, colorize wizard by user's color config, level-specific wizard spawn points
-    lank = @createWizardLank thangID: opponent.id, name: opponent.name, codeLanguage: opponent.codeLanguage
-    if not opponent.levelSlug or opponent.levelSlug is 'brawlwood'
-      lank.targetPos = if opponent.team is 'ogres' then {x: 52, y: 52} else {x: 28, y: 28}
-    else if opponent.levelSlug in ['dungeon-arena', 'sky-span']
-      lank.targetPos = if opponent.team is 'ogres' then {x: 72, y: 39} else {x: 9, y: 39}
-    else if opponent.levelSlug is 'criss-cross'
-      lank.targetPos = if opponent.team is 'ogres' then {x: 50, y: 12} else {x: 0, y: 40}
-    else
-      lank.targetPos = if opponent.team is 'ogres' then {x: 52, y: 28} else {x: 20, y: 28}
-
-  createWizardLank: (options) ->
-    lank = new WizardLank @thangTypeFor('Wizard'), @createLankOptions(options)
-    @addLank lank, lank.thang.id, @layerAdapters['Floating']
-
-  onPlayerJoined: (e) ->
-    # Create another WizardLank, unless this player is just me
-    pid = e.player.id
-    return if pid is me.id
-    wiz = @createWizardLank thangID: pid, lanks: @lanks
-    wiz.animateIn()
-    state = e.player.wizard or {}
-    wiz.setInitialState(state.targetPos, @lanks[state.targetLank])
-
-  onPlayerLeft: (e) ->
-    pid = e.player.id
-    @lanks[pid]?.animateOut => @removeLank @lanks[pid]
+    _.extend options, {
+      @camera
+      resolutionFactor: SPRITE_RESOLUTION_FACTOR
+      groundLayer: @layerAdapters['Ground']
+      textLayer: @surfaceTextLayer
+      floatingLayer: @layerAdapters['Floating']
+      showInvisible: @options.showInvisible
+      @gameUIState
+      @handleEvents
+    }
 
   onSetDebug: (e) ->
     return if e.debug is @debug
@@ -163,6 +127,8 @@ module.exports = class LankBoss extends CocoClass
 
     options = @createLankOptions thang: thang
     options.resolutionFactor = if thangType.get('kind') is 'Floor' then 2 else SPRITE_RESOLUTION_FACTOR
+    if @options.playerNames and /Hero Placeholder/.test thang.id
+      options.playerName = @options.playerNames[thang.team]
     lank = new Lank thangType, options
     @listenTo lank, 'sprite:mouse-up', @onLankMouseUp
     @addLank lank, null, layer
@@ -176,7 +142,6 @@ module.exports = class LankBoss extends CocoClass
     @lankArray.splice @lankArray.indexOf(lank), 1
     @stopListening lank
     lank.destroy()
-    lank.thang = thang  # Keep around so that we know which thang the destroyed thang was for
 
   updateSounds: ->
     lank.playSounds() for lank in @lankArray  # hmm; doesn't work for lanks which we didn't add yet in adjustLankExistence
@@ -196,8 +161,10 @@ module.exports = class LankBoss extends CocoClass
       itemsJustEquipped = itemsJustEquipped.concat @equipNewItems thang if thang.equip
       if lank = @lanks[thang.id]
         lank.setThang thang  # make sure Lank has latest Thang
+        thang.stateChanged = true if @world.synchronous and not thang.stateless  # TODO: think of a more performant thing to do
       else
         lank = @addThangToLanks(thang)
+        thang.stateChanged = true if @world.synchronous and not thang.stateless
         Backbone.Mediator.publish 'surface:new-thang-added', thang: thang, sprite: lank
         updatedObstacles.push lank if lank.sprite.parent is @layerAdapters['Obstacle']
         lank.playSounds()
@@ -250,7 +217,7 @@ module.exports = class LankBoss extends CocoClass
   cacheObstacles: (updatedObstacles=null) ->
     return if @cachedObstacles and not updatedObstacles
     lankArray = @lankArray
-    wallLanks = (lank for lank in lankArray when lank.thangType?.get('name').search(/(dungeon|indoor).wall/i) isnt -1)
+    wallLanks = (lank for lank in lankArray when lank.thangType?.get('name').search(/(dungeon|indoor|ice|classroom|vr).wall/i) isnt -1)
     return if _.any (s.stillLoading for s in wallLanks)
     walls = (lank.thang for lank in wallLanks)
     @world.calculateBounds()
@@ -274,6 +241,8 @@ module.exports = class LankBoss extends CocoClass
 
   onNewWorld: (e) ->
     @world = @options.world = e.world
+    # Clear obstacle cache for this level, since we are spawning walls dynamically
+    @cachedObstacles = false if e.finished and /kithgard-mastery/.test window.location.href
 
   play: ->
     lank.play() for lank in @lankArray
@@ -300,6 +269,7 @@ module.exports = class LankBoss extends CocoClass
     @dragged += 1
 
   onLankMouseUp: (e) ->
+    return unless @handleEvents
     return if key.shift #and @options.choosing
     return @dragged = 0 if @dragged > 3
     @dragged = 0
@@ -308,8 +278,26 @@ module.exports = class LankBoss extends CocoClass
     @selectLank e, lank
 
   onStageMouseDown: (e) ->
+    return unless @handleEvents
     return if key.shift #and @options.choosing
     @selectLank e if e.onBackground
+
+  onChangeSelected: (gameUIState, selected) ->
+    oldLanks = (s.sprite for s in gameUIState.previousAttributes().selected or [])
+    newLanks = (s.sprite for s in selected or [])
+    addedLanks = _.difference(newLanks, oldLanks)
+    removedLanks = _.difference(oldLanks, newLanks)
+
+    for lank in addedLanks
+      layer = if lank.sprite.parent isnt @layerAdapters.Default.container then @layerAdapters.Default else @layerAdapters.Ground
+      mark = new Mark name: 'selection', camera: @camera, layer: layer, thangType: 'selection'
+      mark.toggle true
+      mark.setLank(lank)
+      mark.update()
+      lank.marks.selection = mark # TODO: Figure out how to non-hackily assign lank this mark
+
+    for lank in removedLanks
+      lank.removeMark?('selection')
 
   selectThang: (thangID, spellName=null, treemaThangSelected = null) ->
     return @willSelectThang = [thangID, spellName] unless @lanks[thangID]
@@ -319,8 +307,9 @@ module.exports = class LankBoss extends CocoClass
     return if e and (@disabled or @selectLocked)  # Ignore clicks for selection/panning/wizard movement while disabled or select is locked
     worldPos = lank?.thang?.pos
     worldPos ?= @camera.screenToWorld {x: e.originalEvent.rawX, y: e.originalEvent.rawY} if e?.originalEvent
-    if (not @reallyStopMoving) and worldPos and (@options.navigateToSelection or not lank or treemaThangSelected) and e?.originalEvent?.nativeEvent?.which isnt 3
-      @camera.zoomTo(lank?.sprite or @camera.worldToSurface(worldPos), @camera.zoom, 1000, true)
+    if @handleEvents
+      if (not @reallyStopMoving) and worldPos and (@options.navigateToSelection or not lank or treemaThangSelected) and e?.originalEvent?.nativeEvent?.which isnt 3
+        @camera.zoomTo(lank?.sprite or @camera.worldToSurface(worldPos), @camera.zoom, 1000, true)
     lank = null if @options.choosing  # Don't select lanks while choosing
     if lank isnt @selectedLank
       @selectedLank?.selected = false

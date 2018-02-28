@@ -1,3 +1,4 @@
+require('app/styles/editor/level/modal/world-select-modal.sass')
 ModalView = require 'views/core/ModalView'
 template = require 'templates/editor/level/modal/world-select-modal'
 Surface = require 'lib/surface/Surface'
@@ -47,7 +48,6 @@ module.exports = class WorldSelectModal extends ModalView
     canvases.attr('width', currentView.$el.width()*.8-70)
     canvases.attr('height', currentView.$el.height()*.6)
     @surface = new Surface @world, normalCanvas, webGLCanvas, {
-      wizards: false
       paths: false
       grid: true
       navigateToSelection: false

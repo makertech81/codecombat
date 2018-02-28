@@ -1,12 +1,16 @@
 RootView = require 'views/core/RootView'
 template = require 'templates/i18n/i18n-home-view'
 CocoCollection = require 'collections/CocoCollection'
+Courses = require 'collections/Courses'
+Products = require 'collections/Products'
+Product = require 'models/Product'
 
 LevelComponent = require 'models/LevelComponent'
 ThangType = require 'models/ThangType'
 Level = require 'models/Level'
 Achievement = require 'models/Achievement'
 Campaign = require 'models/Campaign'
+Poll = require 'models/Poll'
 
 languages = _.keys(require 'locale/locale').sort()
 PAGE_SIZE = 100
@@ -29,15 +33,18 @@ module.exports = class I18NHomeView extends RootView
       return 1 if m.generallyCovered
       return 0
 
-    project = ['name', 'components.original', 'i18nCoverage', 'slug']
+    project = ['name', 'components.original', 'i18n', 'i18nCoverage', 'slug']
 
     @thangTypes = new CocoCollection([], { url: '/db/thang.type?view=i18n-coverage', project: project, model: ThangType })
     @components = new CocoCollection([], { url: '/db/level.component?view=i18n-coverage', project: project, model: LevelComponent })
     @levels = new CocoCollection([], { url: '/db/level?view=i18n-coverage', project: project, model: Level })
     @achievements = new CocoCollection([], { url: '/db/achievement?view=i18n-coverage', project: project, model: Achievement })
     @campaigns = new CocoCollection([], { url: '/db/campaign?view=i18n-coverage', project: project, model: Campaign })
+    @polls = new CocoCollection([], { url: '/db/poll?view=i18n-coverage', project: project, model: Poll })
+    @courses = new Courses()
+    @products = new CocoCollection([], { url: '/db/products?view=i18n-coverage', project: project, model: Product })
 
-    for c in [@thangTypes, @components, @levels, @achievements, @campaigns]
+    for c in [@thangTypes, @components, @levels, @achievements, @campaigns, @polls, @courses, @products]
       c.skip = 0
       c.fetch({data: {skip: 0, limit: PAGE_SIZE}, cache:false})
       @supermodel.loadCollection(c, 'documents')
@@ -52,6 +59,9 @@ module.exports = class I18NHomeView extends RootView
         when 'Achievement' then '/i18n/achievement/'
         when 'Level' then '/i18n/level/'
         when 'Campaign' then '/i18n/campaign/'
+        when 'Poll' then '/i18n/poll/'
+        when 'Course' then '/i18n/course/'
+        when 'Product' then '/i18n/product/'
     getMore = collection.models.length is PAGE_SIZE
     @aggregateModels.add(collection.models)
     @render()
@@ -70,6 +80,7 @@ module.exports = class I18NHomeView extends RootView
     covered = (m for m in @aggregateModels.models when m.specificallyCovered).length
     total = @aggregateModels.models.length
     c.progress = if total then parseInt(100 * covered / total) else 100
+    c.showGeneralCoverage = /-/.test(@selectedLanguage ? 'en')  # Only relevant for languages with more than one family, like zh-HANS
 
     c
 
@@ -84,9 +95,9 @@ module.exports = class I18NHomeView extends RootView
   updateCoverageForModel: (model, relatedLanguages) ->
     model.specificallyCovered = true
     model.generallyCovered = true
-    coverage = model.get('i18nCoverage')
+    coverage = model.get('i18nCoverage') ? []
 
-    if @selectedLanguage not in coverage
+    unless @selectedLanguage in coverage
       model.specificallyCovered = false
       if not _.any((l in coverage for l in relatedLanguages))
         model.generallyCovered = false

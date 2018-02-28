@@ -1,3 +1,4 @@
+require('app/styles/editor/thang/thang-type-edit-view.sass')
 ThangType = require 'models/ThangType'
 SpriteParser = require 'lib/sprites/SpriteParser'
 SpriteBuilder = require 'lib/sprites/SpriteBuilder'
@@ -5,7 +6,10 @@ Lank = require 'lib/surface/Lank'
 LayerAdapter = require 'lib/surface/LayerAdapter'
 Camera = require 'lib/surface/Camera'
 DocumentFiles = require 'collections/DocumentFiles'
-require 'vendor/treema'
+require 'lib/setupTreema'
+createjs = require 'lib/createjs-parts'
+LZString = require 'lz-string'
+initSlider = require 'lib/initSlider'
 
 # in the template, but need to require to load them
 require 'views/modal/RevertModal'
@@ -20,8 +24,12 @@ VectorIconSetupModal = require 'views/editor/thang/VectorIconSetupModal'
 SaveVersionModal = require 'views/editor/modal/SaveVersionModal'
 template = require 'templates/editor/thang/thang-type-edit-view'
 storage = require 'core/storage'
+ExportThangTypeModal = require './ExportThangTypeModal'
+RevertModal = require 'views/modal/RevertModal'
 
-CENTER = {x: 200, y: 300}
+require 'lib/game-libraries'
+
+CENTER = {x: 200, y: 400}
 
 commonTasks = [
   'Upload the art.'
@@ -70,20 +78,22 @@ defaultTasks =
     'Add other Components like Shoots or Casts if needed.'
     'Configure other Components, like Moves, Attackable, Attacks, etc.'
     'Override the HasAPI type if it will not be correctly inferred.'
+    'Add to Existence System power table.'
   ]
   Hero: commonTasks.concat animatedThangTypeTasks.concat purchasableTasks.concat [
     'Set the hero class.'
     'Add Extended Hero Name.'
+    'Add Short Hero Name.'
+    'Add Hero Gender.'
     'Upload Hero Doll Images.'
+    'Upload Pose Image.'
     'Start a new name category in names.coffee.'
     'Set up hero stats in Equips, Attackable, Moves.'
     'Set Collects collectRange to 2, Sees visualRange to 60.'
     'Add any custom hero abilities.'
-    'Add to ThangType model hard-coded hero ids/classes list.'
-    'Add to LevelHUDView hard-coded hero short names list.'
-    'Add to InventoryView hard-coded hero gender list.'
-    'Add to PlayHeroesModal hard-coded hero positioning logic.'
-    'Add as unlock to a level and add unlockLevelName here.'
+    'Add to ThangTypeConstants hard-coded hero ids/classes list.'
+    'Add hero gender.'
+    'Add hero short name.'
   ]
   Floor: commonTasks.concat containerTasks.concat [
     'Add 10 x 8.5 snapping.'
@@ -110,6 +120,7 @@ defaultTasks =
   Item: commonTasks.concat purchasableTasks.concat [
     'Set the hero class if class-specific.'
     'Upload Paper Doll Images.'
+    'Configure item stats and abilities.'
   ]
   Missile: commonTasks.concat animatedThangTypeTasks.concat [
     'Make sure there is a launch sound trigger.'
@@ -152,7 +163,15 @@ module.exports = class ThangTypeEditView extends RootView
     'click .play-with-level-parent': 'onPlayLevelSelect'
     'keyup .play-with-level-input': 'onPlayLevelKeyUp'
     'click li:not(.disabled) > #pop-level-i18n-button': 'onPopulateLevelI18N'
+    'mousedown #canvas': 'onCanvasMouseDown'
+    'mouseup #canvas': 'onCanvasMouseUp'
+    'mousemove #canvas': 'onCanvasMouseMove'
+    'click #export-sprite-sheet-btn': 'onClickExportSpriteSheetButton'
+    'click [data-toggle="coco-modal"][data-target="modal/RevertModal"]': 'openRevertModal'
 
+  openRevertModal: (e) ->
+    e.stopPropagation()
+    @openModalView new RevertModal()
 
   onClickSetVectorIcon: ->
     modal = new VectorIconSetupModal({}, @thangType)
@@ -161,7 +180,6 @@ module.exports = class ThangTypeEditView extends RootView
 
   subscriptions:
     'editor:thang-type-color-groups-changed': 'onColorGroupsChanged'
-    'editor:save-new-version': 'saveNewThangType'
 
   # init / render
 
@@ -169,7 +187,7 @@ module.exports = class ThangTypeEditView extends RootView
     super options
     @mockThang = $.extend(true, {}, @mockThang)
     @thangType = new ThangType(_id: @thangTypeID)
-    @thangType = @supermodel.loadModel(@thangType, 'thang').model
+    @thangType = @supermodel.loadModel(@thangType).model
     @thangType.saveBackups = true
     @listenToOnce @thangType, 'sync', ->
       @files = @supermodel.loadCollection(new DocumentFiles(@thangType), 'files').model
@@ -189,7 +207,9 @@ module.exports = class ThangTypeEditView extends RootView
     context.fileSizeString = @fileSizeString
     context
 
-  getAnimationNames: -> _.keys(@thangType.get('actions') or {})
+  getAnimationNames: ->
+    _.sortBy _.keys(@thangType.get('actions') or {}), (a) ->
+      {move: 1, cast: 2, attack: 3, idle: 4, portrait: 6}[a] or 5
 
   afterRender: ->
     super()
@@ -249,7 +269,7 @@ module.exports = class ThangTypeEditView extends RootView
     _.defer @refreshAnimation
     @toggleDots(false)
 
-    createjs.Ticker.setFPS(30)
+    createjs.Ticker.framerate = 30
     createjs.Ticker.addEventListener('tick', @stage)
 
   toggleDots: (newShowDots) ->
@@ -387,7 +407,7 @@ module.exports = class ThangTypeEditView extends RootView
       movieClip.scaleX = movieClip.scaleY = scale
     @showSprite(movieClip)
 
-  getLankOptions: -> {resolutionFactor: @resolution, thang: @mockThang}
+  getLankOptions: -> {resolutionFactor: @resolution, thang: @mockThang, preloadSounds: false}
 
   showAction: (actionName) ->
     options = @getLankOptions()
@@ -409,6 +429,7 @@ module.exports = class ThangTypeEditView extends RootView
     @layerAdapter.resetSpriteSheet()
     @layerAdapter.addLank(lank)
     @currentLank = lank
+    @currentLankOffset = null
 
   showSprite: (sprite) ->
     @clearDisplayObject()
@@ -427,10 +448,10 @@ module.exports = class ThangTypeEditView extends RootView
   # sliders
 
   initSliders: ->
-    @rotationSlider = @initSlider $('#rotation-slider', @$el), 50, @updateRotation
-    @scaleSlider = @initSlider $('#scale-slider', @$el), 29, @updateScale
-    @resolutionSlider = @initSlider $('#resolution-slider', @$el), 39, @updateResolution
-    @healthSlider = @initSlider $('#health-slider', @$el), 100, @updateHealth
+    @rotationSlider = initSlider $('#rotation-slider', @$el), 50, @updateRotation
+    @scaleSlider = initSlider $('#scale-slider', @$el), 29, @updateScale
+    @resolutionSlider = initSlider $('#resolution-slider', @$el), 39, @updateResolution
+    @healthSlider = initSlider $('#health-slider', @$el), 100, @updateHealth
 
   updateRotation: =>
     value = parseInt(180 * (@rotationSlider.slider('value') - 50) / 50)
@@ -534,7 +555,7 @@ module.exports = class ThangTypeEditView extends RootView
       @lastKind = kind
       Backbone.Mediator.publish 'editor:thang-type-kind-changed', kind: kind
       if kind in ['Doodad', 'Floor', 'Wall'] and not @treema.data.terrains
-        @treema.set '/terrains', ['Grass', 'Dungeon', 'Indoor', 'Desert', 'Mountain']  # So editors know to set them.
+        @treema.set '/terrains', ['Grass', 'Dungeon', 'Indoor', 'Desert', 'Mountain', 'Glacier', 'Volcano']  # So editors know to set them.
       if not @treema.data.tasks
         @treema.set '/tasks', (name: t for t in defaultTasks[kind])
 
@@ -581,7 +602,10 @@ module.exports = class ThangTypeEditView extends RootView
     _.delay((-> document.location.reload()), 500)
 
   openSaveModal: ->
-    @openModalView new SaveVersionModal model: @thangType
+    modal = new SaveVersionModal model: @thangType
+    @openModalView modal
+    @listenToOnce modal, 'save-new-version', @saveNewThangType
+    @listenToOnce modal, 'hidden', -> @stopListening(modal)
 
   startForking: (e) ->
     @openModalView new ForkModal model: @thangType, editorPath: 'thang'
@@ -618,6 +642,35 @@ module.exports = class ThangTypeEditView extends RootView
       else
         @childWindow = window.open("/play/level/#{scratchLevelID}", 'child_window', 'width=1024,height=560,left=10,top=10,location=0,menubar=0,scrollbars=0,status=0,titlebar=0,toolbar=0', true)
     @childWindow.focus()
+
+  # Canvas mouse drag handlers
+
+  onCanvasMouseMove: (e) ->
+    return unless p1 = @canvasDragStart
+    p2 = x: e.offsetX, y: e.offsetY
+    offset = x: p2.x - p1.x, y: p2.y - p1.y
+    @currentLank.sprite.x = @currentLankOffset.x + offset.x / @scale
+    @currentLank.sprite.y = @currentLankOffset.y + offset.y / @scale
+    @canvasDragOffset = offset
+
+  onCanvasMouseDown: (e) ->
+    return unless @currentLank
+    @canvasDragStart = x: e.offsetX, y: e.offsetY
+    @currentLankOffset ?= x: @currentLank.sprite.x, y: @currentLank.sprite.y
+
+  onCanvasMouseUp: (e) ->
+    @canvasDragStart = null
+    return unless @canvasDragOffset
+    return unless node = @treema.getLastSelectedTreema()
+    offset = node.get '/'
+    offset.x += Math.round @canvasDragOffset.x
+    offset.y += Math.round @canvasDragOffset.y
+    @canvasDragOffset = null
+    node.set '/', offset
+
+  onClickExportSpriteSheetButton: ->
+    modal = new ExportThangTypeModal({}, @thangType)
+    @openModalView(modal)
 
   destroy: ->
     @camera?.destroy()

@@ -1,100 +1,264 @@
 {me} = require 'core/auth'
 SuperModel = require 'models/SuperModel'
+utils = require 'core/utils'
+CocoClass = require 'core/CocoClass'
+loadSegmentIo = require('core/services/segment')
+api = require('core/api')
 
 debugAnalytics = false
+targetInspectJSLevelSlugs = ['cupboards-of-kithgard']
 
-module.exports = class Tracker
+module.exports = class Tracker extends CocoClass
   constructor: ->
+    super()
     if window.tracker
       console.error 'Overwrote our Tracker!', window.tracker
     window.tracker = @
     @isProduction = document.location.href.search('codecombat.com') isnt -1
-    @identify()
+    @trackReferrers()
     @supermodel = new SuperModel()
+    @identify() # Needs supermodel to exist first
+    @updateRole() if me.get('role') and not me.isSmokeTestUser()
+    if me.isTeacher(true) and @isProduction and not application.testing and not me.isSmokeTestUser()
+      @updateIntercomRegularly()
 
-  identify: (traits) ->
-    console.log 'Would identify', traits if debugAnalytics
-    return unless me and @isProduction and analytics? and not me.isAdmin()
-    # https://segment.io/docs/methods/identify
-    traits ?= {}
-    for userTrait in ['email', 'anonymous', 'dateCreated', 'name', 'wizardColor1', 'testGroupNumber', 'gender', 'lastLevel']
-      traits[userTrait] ?= me.get(userTrait)
-    analytics.identify me.id, traits
+  enableInspectletJS: (levelSlug) ->
+    # InspectletJS loading is delayed and targeting specific levels for more focused investigations
+    return @disableInspectletJS() unless levelSlug in targetInspectJSLevelSlugs
 
-  trackPageView: (virtualName=null, includeIntegrations=null) ->
-    # console.log 'trackPageView', virtualName, includeIntegrations
-    # Google Analytics does not support event-based funnels, so we have to use virtual pageviews instead
-    # https://support.google.com/analytics/answer/1032720?hl=en
-    name = virtualName ? Backbone.history.getFragment()
+    scriptLoaded = =>
+      # Identify and track pageview here, because inspectlet is loaded too late for standard Tracker calls
+      @identify()
+      # http://www.inspectlet.com/docs#virtual_pageviews
+      window.__insp?.push(['virtualPage'])
+    window.__insp = [['wid', 2102699786]]
+    insp = document.createElement('script')
+    insp.type = 'text/javascript'
+    insp.async = true
+    insp.id = 'inspsync'
+    insp.src = (if 'https:' == document.location.protocol then 'https' else 'http') + '://cdn.inspectlet.com/inspectlet.js'
+    insp.onreadystatechange = -> scriptLoaded() if insp.readyState is 'complete'
+    insp.onload = scriptLoaded
+    x = document.getElementsByTagName('script')[0]
+    @inspectletScriptNode = x.parentNode.insertBefore insp, x
 
-    properties = {}
-    if virtualName?
-      # Override title and path properties for virtual page view
-      # https://segment.com/docs/libraries/analytics.js/#page
-      properties =
-        title: name
-        path: "/#{name}"
+  disableInspectletJS: ->
+    if @inspectletScriptNode
+      x = document.getElementsByTagName('script')[0]
+      x.parentNode.removeChild(@inspectletScriptNode)
+      @inspectletScriptNode = null
+    delete window.__insp
 
-    options = {}
-    if includeIntegrations?
-      options = integrations: {'All': false}
-      for integration in includeIntegrations
-        options.integrations[integration] = true
+  trackReferrers: ->
+    elapsed = new Date() - new Date(me.get('dateCreated'))
+    return unless elapsed < 5 * 60 * 1000
+    return if me.get('siteref') or me.get('referrer')
+    changed = false
+    if siteref = utils.getQueryVariable '_r'
+      me.set 'siteref', siteref
+      changed = true
+    if referrer = document.referrer
+      me.set 'referrer', referrer
+      changed = true
+    me.patch() if changed
 
-    console.log "Would track analytics pageview: '/#{name}'", properties, options, includeIntegrations if debugAnalytics
-    return unless @isProduction and analytics? and not me.isAdmin()
+  identify: (traits={}) ->
+    return unless me
 
-    # Ok to pass empty properties, but maybe not options
-    # TODO: What happens when we pass empty options?
-    if _.isEmpty options
-      # console.log "trackPageView without options '/#{name}'", properties, options
-      analytics.page "/#{name}"
-    else
-      # console.log "trackPageView with options '/#{name}'", properties, options
-      analytics.page "/#{name}", properties, options
+    # Save explicit traits for internal tracking
+    @explicitTraits ?= {}
+    @explicitTraits[key] = value for key, value of traits
 
-  trackEvent: (action, properties, includeIntegrations=null) =>
-    # 'action' is a string
-    # Google Analytics properties format: {category: 'Account', label: 'Premium', value: 50 }
-    # https://segment.com/docs/integrations/google-analytics/#track
-    # https://developers.google.com/analytics/devguides/collection/gajs/eventTrackerGuide#Anatomy
-    # Mixpanel properties format: whatever you want unlike GA
-    # https://segment.com/docs/integrations/mixpanel/
-    properties = properties or {}
+    traitsToReport = ['email', 'anonymous', 'dateCreated', 'hourOfCode', 'name', 'referrer', 'testGroupNumber', 'gender', 'lastLevel', 'siteref', 'ageRange', 'schoolName', 'coursePrepaidID', 'role']
+    if me.isTeacher(true)
+      traitsToReport.push('firstName', 'lastName')
+    for userTrait in traitsToReport
+      traits[userTrait] ?= me.get(userTrait) if me.get(userTrait)?
+    if me.isTeacher(true)
+      traits.teacher = true
+    traits.host = document.location.host
 
-    @trackEventInternal action, _.cloneDeep properties unless me?.isAdmin() and @isProduction
+    console.log 'Would identify', me.id, traits if debugAnalytics
+    return if me.isSmokeTestUser()
+    @trackEventInternal('Identify', {id: me.id, traits}) unless me?.isAdmin() and @isProduction
+    return unless @isProduction and not me.isAdmin()
 
-    console.log 'Would track analytics event:', action, properties, includeIntegrations if debugAnalytics
-    return unless me and @isProduction and analytics? and not me.isAdmin()
-    context = {}
-    if includeIntegrations
-      # https://segment.com/docs/libraries/analytics.js/#selecting-integrations
-      context.integrations = {'All': false}
-      for integration in includeIntegrations
-        context.integrations[integration] = true
-    analytics?.track action, properties, context
+    # Errorception
+    # https://errorception.com/docs/meta
+    _errs?.meta = traits
+
+    # Inspectlet
+    # https://www.inspectlet.com/docs#identifying_users
+    __insp?.push ['identify', me.id]
+    __insp?.push ['tagSession', traits]
+
+    # Mixpanel
+    # https://mixpanel.com/help/reference/javascript
+    # mixpanel?.identify(me.id)
+    # mixpanel?.register(traits)
+
+    if me.isTeacher(true) and @segmentLoaded
+      traits.createdAt = me.get 'dateCreated'  # Intercom, at least, wants this
+      analytics.identify me.id, traits
+
+  trackPageView: (includeIntegrations=[]) ->
+    includeMixpanel = (name) ->
+      # mixpanelIncludes = []
+      # name in mixpanelIncludes or /courses|students|teachers/ig.test(name)
+      false
+
+    name = Backbone.history.getFragment()
+    url = "/#{name}"
+    console.log "Would track analytics pageview: #{url} Mixpanel=#{includeMixpanel(name)}" if debugAnalytics
+    @trackEventInternal 'Pageview', url: name, href: window.location.href unless me?.isAdmin() and @isProduction or me.isSmokeTestUser()
+    return unless @isProduction and not me.isAdmin() and not me.isSmokeTestUser()
+
+    # Google Analytics
+    # https://developers.google.com/analytics/devguides/collection/analyticsjs/pages
+    ga? 'send', 'pageview', url
+    ga?('codeplay.send', 'pageview', url) if features.codePlay
+    window.snowplow 'trackPageView'
+
+    # Mixpanel
+    # mixpanel?.track('page viewed', 'page name' : name, url : url) if includeMixpanel(name)
+
+    if me.isTeacher(true) and @segmentLoaded
+      options = {}
+      if includeIntegrations?.length
+        options.integrations = All: false
+        for integration in includeIntegrations
+          options.integrations[integration] = true
+      analytics.page url, {}, options
+
+  trackEvent: (action, properties={}, includeIntegrations=[]) =>
+    console.log 'Tracking external analytics event:', action, properties, includeIntegrations if debugAnalytics
+    return unless me and @isProduction and not me.isAdmin() and not me.isSmokeTestUser()
+
+    @trackEventInternal action, _.cloneDeep properties
+    @trackSnowplow action, _.cloneDeep properties
+
+    unless action in ['View Load', 'Script Started', 'Script Ended', 'Heard Sprite']
+      # Google Analytics
+      # https://developers.google.com/analytics/devguides/collection/analyticsjs/events
+      gaFieldObject =
+        hitType: 'event'
+        eventCategory: properties.category ? 'All'
+        eventAction: action
+      gaFieldObject.eventLabel = properties.label if properties.label?
+      gaFieldObject.eventValue = properties.value if properties.value?
+      ga? 'send', gaFieldObject
+      ga? 'codeplay.send', gaFieldObject if features.codePlay
+
+    # Inspectlet
+    # http://www.inspectlet.com/docs#tagging
+    __insp?.push ['tagSession', action: action, properies: properties]
+
+    # Mixpanel
+    # Only log explicit events for now
+    # mixpanel?.track(action, properties) if 'Mixpanel' in includeIntegrations
+
+    if me.isTeacher(true) and @segmentLoaded
+      options = {}
+      if includeIntegrations
+        # https://segment.com/docs/libraries/analytics.js/#selecting-integrations
+        options.integrations = All: false
+        for integration in includeIntegrations
+          options.integrations[integration] = true
+      analytics?.track action, {}, options
+
+  trackSnowplow: (event, properties) =>
+    return if me.isSmokeTestUser()
+    return if event in [
+      'Simulator Result',
+      'Started Level Load', 'Finished Level Load',
+      'Start HoC Campaign', 'Show Amazon Modal Button', 'Click Amazon Modal Button', 'Click Amazon link',
+    ]
+    # Trimming properties we don't use internally
+    # TODO: delete properites.level for 'Saw Victory' after 2/8/15.  Should be using levelID instead.
+    if event in ['Clicked Start Level', 'Inventory Play', 'Heard Sprite', 'Started Level', 'Saw Victory', 'Click Play', 'Choose Inventory', 'Homepage Loaded', 'Change Hero']
+      delete properties.label
+
+    if event is 'View Load' # TODO: Update snowplow schema to include these
+      delete properties.totalEssentialEncodedBodySize
+      delete properties.totalEssentialTransferSize
+      delete properties.cachedEssentialResources
+      delete properties.totalEssentialResources
+
+    # SnowPlow
+    snowplowAction = event.toLowerCase().replace(/[^a-z0-9]+/ig, '_')
+    properties.user = me.id
+    delete properties.category
+    #console.log "SnowPlow", snowplowAction, properties
+
+    try
+      schema = require("schemas/events/" + snowplowAction + ".json")
+    catch
+      console.warn('Schema not found for snowplow action: ', snowplowAction, properties)
+      return
+
+    unless @isProduction
+      result = tv4.validateResult(properties, schema)
+      if not result.valid
+        text = 'Snowplow event schema validation failed! See console'
+        console.log 'Snowplow event failure info:', {snowplowAction, properties, error: result.error}
+        noty {text, layout: 'center', type: 'error', killer: false, timeout: 5000, dismissQueue: true, maxVisible: 3}
+
+    window.snowplow 'trackUnstructEvent',
+      schema: "iglu:com.codecombat/#{snowplowAction}/jsonschema/#{schema.self.version}"
+      data: properties
 
   trackEventInternal: (event, properties) =>
+    return if me.isSmokeTestUser()
+    return unless @supermodel?
     # Skipping heavily logged actions we don't use internally
-    unless event in ['Simulator Result', 'Started Level Load', 'Finished Level Load']
-      # Trimming properties we don't use internally
-      # TODO: delete internalProperites.level for 'Saw Victory' after 2/8/15.  Should be using levelID instead.
-      if event in ['Clicked Level', 'Inventory Play', 'Heard Sprite', 'Started Level', 'Saw Victory', 'Click Play', 'Choose Inventory', 'Loaded World Map', 'Homepage Loaded', 'Change Hero']
-        delete properties.category
-        delete properties.label
-      else if event in ['Started Signup', 'Finished Signup', 'Login', 'Facebook Login', 'Google Login']
-        delete properties.category
+    return if event in ['Simulator Result', 'Started Level Load', 'Finished Level Load', 'View Load']
+    # Trimming properties we don't use internally
+    # TODO: delete properites.level for 'Saw Victory' after 2/8/15.  Should be using levelID instead.
+    if event in ['Clicked Start Level', 'Inventory Play', 'Heard Sprite', 'Started Level', 'Saw Victory', 'Click Play', 'Choose Inventory', 'Homepage Loaded', 'Change Hero']
+      delete properties.category
+      delete properties.label
+    else if event in ['Loaded World Map', 'Started Signup', 'Finished Signup', 'Login', 'Facebook Login', 'Google Login', 'Show subscription modal']
+      delete properties.category
 
-      console.log 'Tracking internal analytics event:', event, properties if debugAnalytics
-      request = @supermodel.addRequestResource 'log_event', {
-        url: '/db/analytics_log_event/-/log_event'
-        data: {event: event, properties: properties}
-        method: 'POST'
-      }, 0
-      request.load()
+    properties[key] = value for key, value of @explicitTraits if @explicitTraits?
+    console.log 'Tracking internal analytics event:', event, properties if debugAnalytics
 
-  trackTiming: (duration, category, variable, label, samplePercentage=5) ->
-    # https://developers.google.com/analytics/devguides/collection/gajs/gaTrackingTiming
+    api.analyticsLogEvents.post({event, properties})
+
+  trackTiming: (duration, category, variable, label) ->
+    # https://developers.google.com/analytics/devguides/collection/analyticsjs/user-timings
     return console.warn "Duration #{duration} invalid for trackTiming call." unless duration >= 0 and duration < 60 * 60 * 1000
     console.log 'Would track timing event:', arguments if debugAnalytics
-    window._gaq?.push ['_trackTiming', category, variable, duration, label, samplePercentage]
+    return unless me and @isProduction and not me.isAdmin() and not me.isSmokeTestUser()
+    ga? 'send', 'timing', category, variable, duration, label
+
+  updateIntercomRegularly: ->
+    return if me.isSmokeTestUser()
+    timesChecked = 0
+    updateIntercom = =>
+      # Check for new Intercom messages!
+      # Intercom only allows 10 updates for free per page refresh; then 1 per 30min
+      # https://developers.intercom.com/docs/intercom-javascript#section-intercomupdate
+      window.Intercom?('update')
+      timesChecked += 1
+      timeUntilNext = (if timesChecked < 10 then 5*60*1000 else 30*60*1000)
+      setTimeout(updateIntercom, timeUntilNext)
+    setTimeout(updateIntercom, 5*60*1000)
+
+  updateRole: ->
+    return if me.isAdmin() or me.isSmokeTestUser()
+    return unless me.isTeacher(true)
+    loadSegmentIo()
+    .then =>
+      @segmentLoaded = true
+      @identify()
+      @trigger 'segment-loaded'
+    #analytics.page()  # It looks like we don't want to call this here because it somehow already gets called once in addition to this.
+    # TODO: record any events and pageviews that have built up before we knew we were a teacher.
+
+  updateTrialRequestData: (attrs) ->
+    return if me.isSmokeTestUser()
+    loadSegmentIo()
+    .then =>
+      @segmentLoaded = true
+      @identify(attrs)

@@ -2,6 +2,10 @@ CocoModel = require 'models/CocoModel'
 CocoCollection = require 'collections/CocoCollection'
 {me} = require('core/auth')
 locale = require 'locale/locale'
+aceUtils = require 'core/aceUtils'
+createjs = require 'lib/createjs-parts'
+require('vendor/scripts/jquery-ui-1.11.1.custom')
+require('vendor/styles/jquery-ui-1.11.1.custom.css')
 
 initializeFilePicker = ->
   require('core/services/filepicker')() unless window.application.isIPadApp
@@ -34,7 +38,7 @@ class LiveEditingMarkup extends TreemaNode.nodeMap.ace
     valEl.append($('<div class="preview"></div>').hide())
 
   addImageUpload: (valEl) ->
-    return unless me.isAdmin()
+    return unless me.isAdmin() or me.isArtisan()
     valEl.append(
       $('<div class="pick-image-button"></div>').append(
         $('<button>Pick Image</button>')
@@ -96,8 +100,16 @@ class SoundFileTreema extends TreemaNode.nodeMap.string
 
   buildValueForDisplay: (valEl, data) ->
     mimetype = "audio/#{@keyForParent}"
+    mimetypes = [mimetype]
+    if mimetype is 'audio/mp3'
+      # https://github.com/codecombat/codecombat/issues/445
+      # http://stackoverflow.com/questions/10688588/which-mime-type-should-i-use-for-mp3
+      mimetypes.push 'audio/mpeg'
+    else if mimetype is 'audio/ogg'
+      mimetypes.push 'application/ogg'
+      mimetypes.push 'video/ogg'  # huh, that's what it took to be able to upload ogg sounds in Firefox
     pickButton = $('<a class="btn btn-primary btn-xs"><span class="glyphicon glyphicon-upload"></span></a>')
-      .click(=> filepicker.pick {mimetypes:[mimetype]}, @onFileChosen)
+      .click(=> filepicker.pick {mimetypes: mimetypes}, @onFileChosen)
     playButton = $('<a class="btn btn-primary btn-xs"><span class="glyphicon glyphicon-play"></span></a>')
       .click(@playFile)
     stopButton = $('<a class="btn btn-primary btn-xs"><span class="glyphicon glyphicon-stop"></span></a>')
@@ -116,7 +128,7 @@ class SoundFileTreema extends TreemaNode.nodeMap.string
     menu = $('<div class="dropdown-menu"></div>')
     files = @getFiles()
     for file in files
-      continue unless file.get('contentType') is mimetype
+      continue unless file.get('contentType') in mimetypes
       path = file.get('metadata').path
       filename = file.get 'filename'
       fullPath = [path, filename].join('/')
@@ -226,34 +238,27 @@ class ImageFileTreema extends TreemaNode.nodeMap.string
     @refreshDisplay()
 
 
-codeLanguages =
-  javascript: 'ace/mode/javascript'
-  coffeescript: 'ace/mode/coffee'
-  python: 'ace/mode/python'
-  clojure: 'ace/mode/clojure'
-  lua: 'ace/mode/lua'
-  io: 'ace/mode/text'
-
 class CodeLanguagesObjectTreema extends TreemaNode.nodeMap.object
   childPropertiesAvailable: ->
-    (key for key in _.keys(codeLanguages) when not @data[key]? and not (key is 'javascript' and @workingSchema.skipJavaScript))
+    (key for key in _.keys(aceUtils.aceEditModes) when not @data[key]? and not (key is 'javascript' and @workingSchema.skipJavaScript))
 
 class CodeLanguageTreema extends TreemaNode.nodeMap.string
   buildValueForEditing: (valEl, data) ->
     super(valEl, data)
-    valEl.find('input').autocomplete(source: _.keys(codeLanguages), minLength: 0, delay: 0, autoFocus: true)
+    valEl.find('input').autocomplete(source: _.keys(aceUtils.aceEditModes), minLength: 0, delay: 0, autoFocus: true)
     valEl
 
 class CodeTreema extends TreemaNode.nodeMap.ace
   constructor: ->
     super(arguments...)
     @workingSchema.aceTabSize = 4
+    # TODO: Find a less hacky solution for this
+    @workingSchema.aceMode = mode if mode = aceUtils.aceEditModes[@keyForParent]
+    @workingSchema.aceMode = mode if mode = aceUtils.aceEditModes[@parent?.data?.language]
 
-  buildValueForEditing: (valEl, data) ->
-    super(valEl, data)
-    if not @workingSchema.aceMode and mode = codeLanguages[@keyForParent]
-      @editor.getSession().setMode mode
-    valEl
+  initEditor: (args...) ->
+    super args...
+    @editor.setPrintMarginColumn 60
 
 class CoffeeTreema extends CodeTreema
   constructor: ->
@@ -380,7 +385,7 @@ module.exports.LatestVersionReferenceNode = class LatestVersionReferenceNode ext
   formatDocument: (docOrModel) ->
     return @modelToString(docOrModel) if docOrModel instanceof CocoModel
     return 'Unknown' unless @settings.supermodel?
-    m = CocoModel.getReferencedModel(@getData(), @workingSchema)
+    m = @getReferencedModel(@getData(), @workingSchema)
     data = @getData()
     if _.isString data  # LatestVersionOriginalReferenceNode just uses original
       if m.schema().properties.version
@@ -395,6 +400,36 @@ module.exports.LatestVersionReferenceNode = class LatestVersionReferenceNode ext
       @settings.supermodel.registerModel(m)
     return 'Unknown - ' + (data.original ? data) unless m
     return @modelToString(m)
+
+  getReferencedModel: (data, schema) ->
+    return null unless schema.links?
+    linkObject = _.find schema.links, rel: 'db'
+    return null unless linkObject
+    return null if linkObject.href.match('thang.type') and not CocoModel.isObjectID(data)  # Skip loading hardcoded Thang Types for now (TODO)
+
+    # not fully extensible, but we can worry about that later
+    link = linkObject.href
+    link = link.replace('{(original)}', data.original)
+    link = link.replace('{(majorVersion)}', '' + (data.majorVersion ? 0))
+    link = link.replace('{($)}', data)
+    @getOrMakeModelFromLink(link)
+
+  getOrMakeModelFromLink: (link) ->
+    makeUrlFunc = (url) -> -> url
+    modelUrl = link.split('/')[2]
+    modelModule = _.string.classify(modelUrl)
+    modulePath = "models/#{modelModule}"
+
+    modulePath = modulePath.replace(/^models\//,'')
+    try
+      Model = require('app/models/' + modulePath) # TODO webpack: Get this working async for chunking
+    catch e
+      console.error 'could not load model from link path', link, 'using path', modulePath
+      return
+
+    model = new Model()
+    model.url = makeUrlFunc(link)
+    return model
 
   saveChanges: ->
     selected = @getSelectedResultEl()

@@ -1,44 +1,97 @@
+require('app/styles/play/ladder/my_matches_tab.sass')
 CocoView = require 'views/core/CocoView'
 Level = require 'models/Level'
 LevelSession = require 'models/LevelSession'
 LeaderboardCollection  = require 'collections/LeaderboardCollection'
 LadderSubmissionView = require 'views/play/common/LadderSubmissionView'
 {teamDataFromLevel} = require './utils'
-require 'vendor/d3'
+require 'd3/d3.js'
 
 module.exports = class MyMatchesTabView extends CocoView
   id: 'my-matches-tab-view'
   template: require 'templates/play/ladder/my_matches_tab'
 
-  constructor: (options, @level, @sessions) ->
-    super(options)
+  initialize: (options, @level, @sessions) ->
     @nameMap = {}
     @previouslyRankingTeams = {}
-    @refreshMatches()
+    @refreshMatches 20
 
-  refreshMatches: ->
+  refreshMatches: (@refreshDelay) ->
     @teams = teamDataFromLevel @level
+
+    convertMatch = (match, submitDate) =>
+      opponent = match.opponents[0]
+      state = 'win'
+      state = 'loss' if match.metrics.rank > opponent.metrics.rank
+      state = 'tie' if match.metrics.rank is opponent.metrics.rank
+      fresh = match.date > (new Date(new Date() - @refreshDelay * 1000)).toISOString()
+      if fresh
+        @playSound 'chat_received'
+      {
+        state: state
+        opponentName: @nameMap[opponent.userID]
+        opponentID: opponent.userID
+        when: moment(match.date).fromNow()
+        sessionID: opponent.sessionID
+        stale: match.date < submitDate
+        fresh: fresh
+        codeLanguage: match.codeLanguage
+        simulator: if match.simulator then JSON.stringify(match.simulator) + ' | seed ' + match.randomSeed else ''
+      }
+
+    for team in @teams
+      team.session = (s for s in @sessions.models when s.get('team') is team.id)[0]
+      stats = @statsFromSession team.session
+      team.readyToRank = team.session?.readyToRank()
+      team.isRanking = team.session?.get('isRanking')
+      team.matches = (convertMatch(match, team.session.get('submitDate')) for match in (stats?.matches or []))
+      team.matches.reverse()
+      team.score = (stats?.totalScore ? 10).toFixed(2)
+      team.wins = _.filter(team.matches, {state: 'win', stale: false}).length
+      team.ties = _.filter(team.matches, {state: 'tie', stale: false}).length
+      team.losses = _.filter(team.matches, {state: 'loss', stale: false}).length
+      scoreHistory = stats?.scoreHistory
+      if scoreHistory?.length > 1
+        team.scoreHistory = scoreHistory
+
+      if not team.isRanking and @previouslyRankingTeams[team.id]
+        @playSound 'cast-end'
+      @previouslyRankingTeams[team.id] = team.isRanking
+
     @loadNames()
 
   loadNames: ->
     # Only fetch the names for the userIDs we don't already have in @nameMap
     ids = []
     for session in @sessions.models
-      for match in (session.get('matches') or [])
+      matches = @statsFromSession(session).matches or []
+      for match in matches
         id = match.opponents[0].userID
         unless id
           console.error 'Found bad opponent ID in malformed match:', match, 'from session', session
           continue
         ids.push id unless @nameMap[id]
 
+    ids = _.uniq ids
     return unless ids.length
 
     success = (nameMap) =>
       return if @destroyed
       for session in @sessions.models
-        for match in session.get('matches') or []
+        matches = @statsFromSession(session).matches or []
+        for match in matches
           opponent = match.opponents[0]
-          @nameMap[opponent.userID] ?= nameMap[opponent.userID]?.name ? '<bad match data>'
+          continue if @nameMap[opponent.userID]
+          opponentUser = nameMap[opponent.userID]
+          name = opponentUser?.name
+          name ||= opponentUser.firstName + ' ' + opponentUser.lastName if opponentUser?.firstName
+          name ||= "Anonymous #{opponent.userID.substr(18)}" if opponentUser
+          unless name
+            console.log 'found', nameMap[opponent.userID], 'for', opponent.userID, "http://codecombat.com/db/user/#{opponent.userID}"
+          name ||= '<bad match data>'
+          if name.length > 21
+            name = name.substr(0, 18) + '...'
+          @nameMap[opponent.userID] = name
       @render() if @supermodel.finished()
 
     userNamesRequest = @supermodel.addRequestResource 'user_names', {
@@ -49,51 +102,6 @@ module.exports = class MyMatchesTabView extends CocoView
     }, 0
     userNamesRequest.load()
 
-  getRenderData: ->
-    ctx = super()
-    ctx.level = @level
-    ctx.levelID = @level.get('slug') or @level.id
-    ctx.teams = @teams
-
-    convertMatch = (match, submitDate) =>
-      opponent = match.opponents[0]
-      state = 'win'
-      state = 'loss' if match.metrics.rank > opponent.metrics.rank
-      state = 'tie' if match.metrics.rank is opponent.metrics.rank
-      fresh = match.date > (new Date(new Date() - 20 * 1000)).toISOString()
-      if fresh
-        Backbone.Mediator.publish 'audio-player:play-sound', trigger: 'chat_received'
-      {
-        state: state
-        opponentName: @nameMap[opponent.userID]
-        opponentID: opponent.userID
-        when: moment(match.date).fromNow()
-        sessionID: opponent.sessionID
-        stale: match.date < submitDate
-        fresh: fresh
-        codeLanguage: match.codeLanguage
-      }
-
-    for team in @teams
-      team.session = (s for s in @sessions.models when s.get('team') is team.id)[0]
-      team.readyToRank = team.session?.readyToRank()
-      team.isRanking = team.session?.get('isRanking')
-      team.matches = (convertMatch(match, team.session.get('submitDate')) for match in team.session?.get('matches') or [])
-      team.matches.reverse()
-      team.score = (team.session?.get('totalScore') or 10).toFixed(2)
-      team.wins = _.filter(team.matches, {state: 'win', stale: false}).length
-      team.ties = _.filter(team.matches, {state: 'tie', stale: false}).length
-      team.losses = _.filter(team.matches, {state: 'loss', stale: false}).length
-      scoreHistory = team.session?.get('scoreHistory')
-      if scoreHistory?.length > 1
-        team.scoreHistory = scoreHistory
-
-      if not team.isRanking and @previouslyRankingTeams[team.id]
-        Backbone.Mediator.publish 'audio-player:play-sound', trigger: 'cast-end'
-      @previouslyRankingTeams[team.id] = team.isRanking
-
-    ctx
-
   afterRender: ->
     super()
     @removeSubView subview for key, subview of @subviews when subview instanceof LadderSubmissionView
@@ -101,7 +109,9 @@ module.exports = class MyMatchesTabView extends CocoView
       placeholder = $(el)
       sessionID = placeholder.data('session-id')
       session = _.find @sessions.models, {id: sessionID}
-      ladderSubmissionView = new LadderSubmissionView session: session, level: @level
+      if @level.get('slug') in ['ace-of-coders', 'elemental-wars', 'the-battle-of-sky-span', 'tesla-tesoro', 'escort-duty']
+        mirrorSession = (s for s in @sessions.models when s.get('team') isnt session.get('team'))[0]
+      ladderSubmissionView = new LadderSubmissionView session: session, level: @level, mirrorSession: mirrorSession
       @insertSubView ladderSubmissionView, placeholder
 
     @$el.find('.score-chart-wrapper').each (i, el) =>
@@ -110,6 +120,12 @@ module.exports = class MyMatchesTabView extends CocoView
       @generateScoreLineChart(scoreWrapper.attr('id'), team.scoreHistory, team.name)
 
     @$el.find('tr.fresh').removeClass('fresh', 5000)
+
+  statsFromSession: (session) ->
+    return null unless session
+    if @options.league
+      return _.find(session.get('leagues') or [], leagueID: @options.league.id)?.stats ? {}
+    session.attributes
 
   generateScoreLineChart: (wrapperID, scoreHistory, teamName) =>
     margin =
@@ -143,7 +159,12 @@ module.exports = class MyMatchesTabView extends CocoView
       }
 
     x.domain(d3.extent(data, (d) -> d.date))
-    y.domain(d3.extent(data, (d) -> d.close))
+    [yMin, yMax] = d3.extent(data, (d) -> d.close)
+    yRange = yMax - yMin
+    yMid = yMin + yRange / 2
+    yMin = Math.min yMin, yMid - 500
+    yMax = Math.max yMax, yMid + 500
+    y.domain([yMin, yMax])
 
     svg.append('g')
       .attr('class', 'y axis')

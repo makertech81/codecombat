@@ -1,20 +1,23 @@
-mail = require '../commons/mail'
-MailSent = require '../mail/sent/MailSent'
-UserRemark = require '../users/remarks/UserRemark'
-User = require '../users/User'
+mailChimp = require '../lib/mail-chimp'
+MailSent = require '../models/MailSent'
+UserRemark = require '../models/UserRemark'
+User = require '../models/User'
 async = require 'async'
 errors = require '../commons/errors'
 config = require '../../server_config'
-LevelSession = require '../levels/sessions/LevelSession'
-Level = require '../levels/Level'
+LevelSession = require '../models/LevelSession'
+Level = require '../models/Level'
 log = require 'winston'
 sendwithus = require '../sendwithus'
+wrap = require 'co-express'
+
 if config.isProduction and config.redis.host isnt 'localhost'
   lockManager = require '../commons/LockManager'
 
 module.exports.setup = (app) ->
-  app.all config.mail.mailchimpWebhook, handleMailchimpWebHook
+  app.all config.mail.mailChimpWebhook, handleMailChimpWebHook
   app.get '/mail/cron/ladder-update', handleLadderUpdate
+  app.get '/mail/cron/next-steps', handleNextSteps
   if lockManager
     setupScheduledEmails()
 
@@ -470,6 +473,7 @@ taskReminderAlreadySentThisWeekFilter = (task, cb) ->
 sendUserRemarkTaskEmail = (task, cb) ->
   mailTaskName = @mailTaskName
   User.findOne("_id":task.contact).select("email").lean().exec (err, contact) ->
+    return if not contact.email
     if err? then return cb err
     User.findOne("_id":task.user).select("jobProfile.name").lean().exec (err, user) ->
       if err? then return cb err
@@ -517,8 +521,8 @@ employerMatchingCandidateNotificationTask = ->
   lockManager.setLock mailTaskName, lockDurationMs, (err, lockResult) ->
 ###
 ### End Employer Matching Candidate Notification Email ###
-### Ladder Update Email ###
 ### Employer ignore ###
+
 DEBUGGING = false
 LADDER_PREGAME_INTERVAL = 2 * 3600 * 1000  # Send emails two hours before players last submitted.
 getTimeFromDaysAgo = (now, daysAgo) ->
@@ -534,17 +538,15 @@ isRequestFromDesignatedCronHandler = (req, res) ->
     return false
   return true
 
-
+### Ladder Update Email ###
 
 handleLadderUpdate = (req, res) ->
-  #log.info('Going to see about sending ladder update emails.')
-  requestIsFromDesignatedCronHandler = DEBUGGING or isRequestFromDesignatedCronHandler req, res
-  return unless requestIsFromDesignatedCronHandler
-
+  return unless DEBUGGING or isRequestFromDesignatedCronHandler req, res
   res.send('Great work, Captain Cron! I can take it from here.')
   res.end()
   # TODO: somehow fetch the histograms
-  emailDays = [1, 2, 4, 7, 14, 30]
+  #emailDays = [1, 2, 4, 7, 14, 30]
+  emailDays = [1, 3, 7]  # Reduced to keep smaller monthly recipient footprint
   now = new Date()
   for daysAgo in emailDays
     # Get every session that was submitted in a 5-minute window after the time.
@@ -568,6 +570,7 @@ handleLadderUpdate = (req, res) ->
 
 sendLadderUpdateEmail = (session, now, daysAgo) ->
   User.findOne({_id: session.creator}).select('name email firstName lastName emailSubscriptions emails preferredLanguage').exec (err, user) ->
+    return if not user.get('email')
     if err
       log.error "Couldn't find user for #{session.creator} from session #{session._id}"
       return
@@ -579,7 +582,7 @@ sendLadderUpdateEmail = (session, now, daysAgo) ->
       #log.info "Not sending email to #{user.get('email')} #{user.get('name')} because the session had levelName #{session.levelName} or team #{session.team} in it."
       return
     name = if user.get('firstName') and user.get('lastName') then "#{user.get('firstName')}" else user.get('name')
-    name = 'Wizard' if not name or name is 'Anoner'
+    name = 'Wizard' if not name or name is 'Anonymous'
 
     # Fetch the most recent defeat and victory, if there are any.
     # (We could look at strongest/weakest, but we'd have to fetch everyone, or denormalize more.)
@@ -617,19 +620,19 @@ sendLadderUpdateEmail = (session, now, daysAgo) ->
         log.error "Error sending ladder update email: #{err} with result #{result}" if err
 
     urlForMatch = (match) ->
-      "http://codecombat.com/play/level/#{session.levelID}?team=#{session.team}&session=#{session._id}&opponent=#{match.opponents[0].sessionID}"
+      "http://codecombat.com/play/level/#{session.levelID}?team=#{session.team}&opponent=#{match.opponents[0].sessionID}"
 
     onFetchedDefeatedOpponent = (err, defeatedOpponent) ->
       if err
         log.error "Couldn't find defeateded opponent: #{err}"
         defeatedOpponent = null
-      victoryContext = {opponent_name: defeatedOpponent?.name ? 'Anoner', url: urlForMatch(victory)} if victory
+      victoryContext = {opponent_name: defeatedOpponent?.name ? 'Anonymous', url: urlForMatch(victory)} if victory
 
       onFetchedVictoriousOpponent = (err, victoriousOpponent) ->
         if err
           log.error "Couldn't find victorious opponent: #{err}"
           victoriousOpponent = null
-        defeatContext = {opponent_name: victoriousOpponent?.name ? 'Anoner', url: urlForMatch(defeat)} if defeat
+        defeatContext = {opponent_name: victoriousOpponent?.name ? 'Anonymous', url: urlForMatch(defeat)} if defeat
 
         Level.find({original: session.level.original, created: {$gt: session.submitDate}}).select('created commitMessage version').sort('-created').lean().exec (err, levelVersions) ->
           sendEmail defeatContext, victoryContext, (if levelVersions.length then levelVersions else null)
@@ -663,36 +666,123 @@ getScoreHistoryGraphURL = (session, daysAgo) ->
   "https://chart.googleapis.com/chart?chs=600x75&cht=lxy&chtt=Score%3A+#{currentScore}&chts=222222,12,r&chf=a,s,000000FF&chls=2&chd=t:#{chartData}&chxt=y&chxr=0,#{minScore},#{maxScore}"
 
 ### End Ladder Update Email ###
-handleMailchimpWebHook = (req, res) ->
+
+### Next Steps Email ###
+
+handleNextSteps = (req, res) ->
+  return unless DEBUGGING or isRequestFromDesignatedCronHandler req, res
+  res.send('Great work, Captain Cron! I can take it from here.')
+  res.end()
+  emailDays = [1]
+  now = new Date()
+  for daysAgo in emailDays
+    # Get every User that was created in a 5-minute window after the time.
+    startTime = getTimeFromDaysAgo now, daysAgo
+    endTime = startTime + 5 * 60 * 1000
+    findParameters = {dateCreated: {$gt: new Date(startTime), $lte: new Date(endTime)}, emailLower: {$exists: true}}
+    selectString = 'name firstName lastName lastLevel points email gender emailSubscriptions emails dateCreated preferredLanguage aceConfig.language activity stats earned testGroupNumber ageRange courseInstances'
+    query = User.find(findParameters).select(selectString)
+    do (daysAgo) ->
+      query.exec (err, results) ->
+        if err
+          log.error "Couldn't fetch next steps users for #{findParameters}\nError: #{err}"
+          return errors.serverError res, "Next steps email query failed: #{JSON.stringify(err)}"
+        log.info "Found #{results.length} next-steps users to email updates about for #{daysAgo} day(s) ago." if DEBUGGING
+        sendNextStepsEmail result, now, daysAgo for result in results
+
+module.exports.sendNextStepsEmail = sendNextStepsEmail = (user, now, daysAgo) ->
+  return log.info "Not sending next steps email to user with no email address" if not user.get('email')
+  return log.debug "Not sending next steps email to teacher based on role" if user.isTeacher()
+  unless user.isEmailSubscriptionEnabled('generalNews') and user.isEmailSubscriptionEnabled('anyNotes')
+    log.info "Not sending email to #{user.get('email')} #{user.get('name')} because they only want emails about #{JSON.stringify(user.get('emails'))}" if DEBUGGING
+    return
+
+  LevelSession.find({creator: user.get('_id') + ''}).select('levelName levelID changed state.complete playtime').lean().exec (err, sessions) ->
+    return log.error "Couldn't find sessions for #{user.get('email')} #{user.get('name')}: #{err}" if err
+    complete = (s for s in sessions when s.state?.complete)
+    incomplete = (s for s in sessions when not s.state?.complete)
+    return if complete.length < 2
+
+    # TODO: find the next level to do somehow, for real
+    if incomplete.length
+      nextLevel = name: incomplete[0].levelName, slug: incomplete[0].levelID
+    else
+      nextLevel = null
+    err = null
+    do (err, nextLevel) ->
+      return log.error "Couldn't find next level for #{user.get('email')} #{user.get('name')}: #{err}" if err
+      name = if user.get('firstName') and user.get('lastName') then "#{user.get('firstName')}" else user.get('name')
+      name = 'Hero' if not name or name in ['Anoner', 'Anonymous']
+      #secretLevel = switch user.get('testGroupNumber') % 8
+      #  when 0, 1, 2, 3 then name: 'Forgetful Gemsmith', slug: 'forgetful-gemsmith'
+      #  when 4, 5, 6, 7 then name: 'Signs and Portents', slug: 'signs-and-portents'
+      secretLevel = name: 'Signs and Portents', slug: 'signs-and-portents'  # We turned off this test for now and are sending everyone to forgetful-gemsmith
+
+      # TODO: make this smarter, actually data-driven, looking at all available sessions
+      shadowGuardSession = _.find sessions, levelID: 'shadow-guard'
+      isFast = shadowGuardSession and shadowGuardSession.playtime < 90  # Average is 107s
+      isVeryFast = shadowGuardSession and shadowGuardSession.playtime < 75
+      isAdult = user.get('ageRange') in ['18-24', '25-34', '35-44', '45-100']
+      isKid = not isAdult  # Assume kid if not specified
+      # Used to use these categories to customize the email; not doing it right now. TODO: customize it again in Sendwithus.
+      # TODO: do something with the preferredLanguage?
+      context =
+        email_id: sendwithus.templates.next_steps_email
+        recipient:
+          address: if DEBUGGING then 'nick@codecombat.com' else user.get('email')
+          name: name
+        email_data:
+          name: name
+          days_ago: daysAgo
+          nextLevelName: nextLevel?.name
+          nextLevelLink: if nextLevel then "http://codecombat.com/play/level/#{nextLevel.slug}" else null
+          secretLevelName: secretLevel.name
+          secretLevelLink: "http://codecombat.com/play/level/#{secretLevel.slug}"
+          levelsComplete: complete.length
+          isCoursePlayer: user.get('courseInstances')?.length > 0 # TODO: use based on role instead, as courseInstances can be unreliable
+      log.info "Sending next steps email to #{context.recipient.address} with #{context.email_data.nextLevelName} next and #{context.email_data.levelsComplete} levels complete since #{daysAgo} day(s) ago." if DEBUGGING
+      sendwithus.api.send context, (err, result) ->
+        log.error "Error sending next steps email: #{err} with result #{result}" if err
+
+### End Next Steps Email ###
+
+handleMailChimpWebHook = wrap (req, res) ->
   post = req.body
 
-  unless post.type in ['unsubscribe', 'profile']
+  unless post.type in ['unsubscribe', 'profile', 'upemail']
     res.send 'Bad post type'
     return res.end()
 
-  unless post.data.email
+  email = post.data.email or post.data.old_email
+  unless email
     res.send 'No email provided'
     return res.end()
 
-  query = {'mailChimp.leid': post.data.web_id}
-  User.findOne query, (err, user) ->
-    return errors.serverError(res) if err
-    if not user
-      return errors.notFound(res)
+  if post.data.web_id
+    user = yield User.findOne { 'mailChimp.leid': post.data.web_id }
+  if not user
+    user = yield User.findOne { 'mailChimp.email': email }
 
-    handleProfileUpdate(user, post) if post.type is 'profile'
-    handleUnsubscribe(user) if post.type is 'unsubscribe'
+  if not user
+    throw new errors.NotFound('MailChimp subscriber not found')
 
-    user.updatedMailChimp = true # so as not to echo back to mailchimp
-    user.save (err) ->
-      return errors.serverError(res) if err
-      res.end('Success')
+  if not user.get('emailVerified')
+    return res.send('User email unverified')
+
+  if post.type is 'profile'
+    handleProfileUpdate(user, post)
+  else if post.type in ['unsubscribe', 'upemail']
+    handleUnsubscribe(user)
+
+  user.updatedMailChimp = true # so as not to echo back to mailchimp
+  yield user.save()
+  res.end('Success')
 
 module.exports.handleProfileUpdate = handleProfileUpdate = (user, post) ->
-  mailchimpSubs = post.data.merges.INTERESTS.split(', ')
+  mailChimpSubs = post.data.merges.INTERESTS.split(', ')
 
-  for [mailchimpEmailGroup, emailGroup] in _.zip(mail.MAILCHIMP_GROUPS, mail.NEWS_GROUPS)
-    user.setEmailSubscription emailGroup, mailchimpEmailGroup in mailchimpSubs
+  for interest in mailChimp.interests
+    user.setEmailSubscription interest.property, interest.mailChimpLabel in mailChimpSubs
 
   fname = post.data.merges.FNAME
   user.set('firstName', fname) if fname
@@ -706,5 +796,6 @@ module.exports.handleProfileUpdate = handleProfileUpdate = (user, post) ->
 
 module.exports.handleUnsubscribe = handleUnsubscribe = (user) ->
   user.set 'emailSubscriptions', []
-  for emailGroup in mail.NEWS_GROUPS
-    user.setEmailSubscription emailGroup, false
+  for interest in mailChimp.interests
+    user.setEmailSubscription interest.property, false
+  user.set 'mailChimp', undefined

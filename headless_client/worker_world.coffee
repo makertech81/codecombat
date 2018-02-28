@@ -1,20 +1,22 @@
+# NOTE: Dependencies for this may not be cache-busted properly by webpack; take this into account when making changes.
+
 # function to use inside a webworker.
 # This function needs to run inside an environment that has a 'self'.
 # This specific worker is targeted towards the node.js headless_client environment.
 
-JASON = require 'jason'
 fs = require 'fs'
-GLOBAL.Aether = Aether = require 'aether'
+# GLOBAL.Aether = Aether = require 'aether' # TODO: fix with webpack
 GLOBAL._ = _ = require 'lodash'
+GLOBAL.CoffeeScript = require 'coffee-script'
 
 betterConsole = () ->
 
-  self.logLimit = 200;
-  self.logsLogged = 0;
+  self.logLimit = 200
+  self.logsLogged = 0
 
   self.transferableSupported = () -> true
 
-  self.console = log: ->
+  self.console = log: (args...) ->
     if self.logsLogged++ is self.logLimit
       self.postMessage
         type: 'console-log'
@@ -22,7 +24,6 @@ betterConsole = () ->
         id: self.workerID
 
     else if self.logsLogged < self.logLimit
-      args = [].slice.call(arguments)
       i = 0
 
       while i < args.length
@@ -100,17 +101,17 @@ work = () ->
 
     self.postMessage type: 'start-load-frames'
 
-    self.world.loadFrames self.onWorldLoaded, self.onWorldError, self.onWorldLoadProgress, true
+    self.world.loadFrames self.onWorldLoaded, self.onWorldError, self.onWorldLoadProgress, null, true
 
   self.onWorldLoaded = onWorldLoaded = ->
     self.goalManager.worldGenerationEnded()
     goalStates = self.goalManager.getGoalStates()
-    self.postMessage type: 'end-load-frames', goalStates: goalStates
+    self.postMessage type: 'end-load-frames', goalStates: goalStates, overallStatus: goalManager.checkOverallStatus()
 
     t1 = new Date()
     diff = t1 - self.t0
     if (self.world.headless)
-      return console.log("Headless simulation completed in #{diff}ms.");
+      return console.log("Headless simulation completed in #{diff}ms.")
 
     transferableSupported = self.transferableSupported()
     try
@@ -148,7 +149,9 @@ work = () ->
         self.postedErrors[errorKey] = error
     else
       console.log 'Non-UserCodeError:', error.toString() + "\n" + error.stack or error.stackTrace
+      self.postMessage type: 'non-user-code-problem', problem: {message: error.toString()}
       self.cleanUp()
+      return false
     return true
 
   self.onWorldLoadProgress = onWorldLoadProgress = (progress) ->
@@ -176,13 +179,22 @@ work = () ->
 
   self.postMessage type: 'worker-initialized'
 
-worldCode = fs.readFileSync './public/javascripts/world.js', 'utf8'
-lodashCode = fs.readFileSync './public/javascripts/lodash.js', 'utf8'
-aetherCode = fs.readFileSync './public/javascripts/aether.js', 'utf8'
+codeFileContents = []
+for codeFile in [
+    'lodash.js'
+    'world.js'
+    'aether.js'
+    'app/vendor/aether-clojure.js'
+    'app/vendor/aether-coffeescript.js'
+    'app/vendor/aether-io.js'
+    'app/vendor/aether-javascript.js'
+    'app/vendor/aether-lua.js'
+    'app/vendor/aether-python.js'
+    'app/vendor/aether-java.js'
+  ]
+  codeFileContents.push fs.readFileSync(__dirname + "/../public/javascripts/#{codeFile}", 'utf8')
 
 #window.BOX2D_ENABLED = true;
-
-newConsole = "newConsole = #{}JASON.stringify newConsole}()";
 
 ret = """
 
@@ -191,20 +203,18 @@ ret = """
 
   self.workerID = 'Worker';
 
-  console = #{JASON.stringify betterConsole}();
+  console = (#{betterConsole.toString()})();
 
   try {
     // the world javascript file
-    #{worldCode};
-    #{lodashCode};
-    #{aetherCode};
+    #{codeFileContents.join(';\n    ')};
 
     // Don't let user generated code access stuff from our file system!
     self.importScripts = importScripts = null;
     self.native_fs_ = native_fs_ = null;
 
     // the actual function
-    #{JASON.stringify work}();
+    (#{work.toString()})();
   } catch (error) {
     self.postMessage({'type': 'console-log', args: ['An unhandled error occured: ', error.toString(), error.stack], id: -1});
   }

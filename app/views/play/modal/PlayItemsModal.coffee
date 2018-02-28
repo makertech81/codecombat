@@ -1,8 +1,11 @@
+require('app/styles/play/modal/play-items-modal.sass')
 ModalView = require 'views/core/ModalView'
 template = require 'templates/play/modal/play-items-modal'
 buyGemsPromptTemplate = require 'templates/play/modal/buy-gems-prompt'
 ItemDetailsView = require './ItemDetailsView'
 BuyGemsModal = require 'views/play/modal/BuyGemsModal'
+CreateAccountModal = require 'views/core/CreateAccountModal'
+SubscribeModal = require 'views/core/SubscribeModal'
 
 CocoCollection = require 'collections/CocoCollection'
 ThangType = require 'models/ThangType'
@@ -49,14 +52,15 @@ module.exports = class PlayItemsModal extends ModalView
     'click .item': 'onItemClicked'
     'shown.bs.tab': 'onTabClicked'
     'click .unlock-button': 'onUnlockButtonClicked'
+    'click .subscribe-button': 'onSubscribeButtonClicked'
     'click .buy-gems-prompt-button': 'onBuyGemsPromptButtonClicked'
     'click #close-modal': 'hide'
     'click': 'onClickedSomewhere'
-    'update .tab-pane .nano': 'onScrollItemPane'
+    'update .tab-pane .nano': 'showVisibleItemImages'
     'click #hero-type-select label': 'onClickHeroTypeSelect'
 
   constructor: (options) ->
-    @onScrollItemPane = _.throttle(_.bind(@onScrollItemPane, @), 200)
+    @showVisibleItemImages = _.throttle(_.bind(@showVisibleItemImages, @), 200)
     super options
     @items = new Backbone.Collection()
     @itemCategoryCollections = {}
@@ -73,14 +77,17 @@ module.exports = class PlayItemsModal extends ModalView
       'description'
       'i18n'
       'heroClass'
+      'subscriber'
     ]
 
     itemFetcher = new CocoCollection([], { url: '/db/thang.type?view=items', project: project, model: ThangType })
     itemFetcher.skip = 0
     itemFetcher.fetch({data: {skip: 0, limit: PAGE_SIZE}})
     @listenTo itemFetcher, 'sync', @onItemsFetched
+    @stopListening @supermodel, 'loaded-all'
     @supermodel.loadCollection(itemFetcher, 'items')
     @idToItem = {}
+    @trackTimeVisible()
 
   onItemsFetched: (itemFetcher) ->
     gemsOwned = me.gems()
@@ -101,6 +108,10 @@ module.exports = class PlayItemsModal extends ModalView
       model.comingSoon = not model.getFrontFacingStats().props.length and not _.size(model.getFrontFacingStats().stats) and not model.owned  # Temp: while there are placeholder items
       @idToItem[model.id] = model
 
+    if itemFetcher.skip isnt 0
+      # Make sure we render the newly fetched items, except the first time (when it happens automatically).
+      @render()
+
     if needMore
       itemFetcher.skip += PAGE_SIZE
       itemFetcher.fetch({data: {skip: itemFetcher.skip, limit: PAGE_SIZE}})
@@ -116,7 +127,7 @@ module.exports = class PlayItemsModal extends ModalView
   afterRender: ->
     super()
     return unless @supermodel.finished()
-    Backbone.Mediator.publish 'audio-player:play-sound', trigger: 'game-menu-open', volume: 1
+    @playSound 'game-menu-open'
     @$el.find('.nano:visible').nanoScroller({alwaysVisible: true})
     @itemDetailsView = new ItemDetailsView()
     @insertSubView(@itemDetailsView)
@@ -124,16 +135,19 @@ module.exports = class PlayItemsModal extends ModalView
     earnedLevels = me.get('earned')?.levels or []
     if Level.levels['defense-of-plainswood'] not in earnedLevels
       @$el.find('#misc-tab').hide()
+      @$el.find('#hero-type-select #warrior').click()  # Start on warrior tab, if low level.
+    @showVisibleItemImages()
 
   onHidden: ->
     super()
-    Backbone.Mediator.publish 'audio-player:play-sound', trigger: 'game-menu-close', volume: 1
+    @playSound 'game-menu-close'
 
 
   #- Click events
 
   onItemClicked: (e) ->
     return if $(e.target).closest('.unlock-button').length
+    return if @destroyed
     @playSound 'menu-button-click'
     itemEl = $(e.target).closest('.item')
     wasSelected = itemEl.hasClass('selected')
@@ -147,15 +161,35 @@ module.exports = class PlayItemsModal extends ModalView
       else
         itemEl.addClass('selected') unless wasSelected
     @itemDetailsView.setItem(item)
+    @updateViewVisibleTimer()
+
+  currentVisiblePremiumFeature: ->
+    item = @itemDetailsView?.item
+    if 'pet' in (item?.getAllowedSlots() or []) or item?.get('heroClass') in ['Ranger', 'Wizard']
+      return {
+        viewName: @.id
+        featureName: 'view-item'
+        premiumThang:
+          _id: item.id
+          slug: item.get('slug')
+          heroClass: item.get('heroClass')
+          slots: item.getAllowedSlots()
+      }
+    else if @$el.find('.tab-content').hasClass('filter-wizard')
+      return { viewName: @.id, featureName: 'filter-wizard' }
+    else if @$el.find('.tab-content').hasClass('filter-ranger')
+      return { viewName: @.id, featureName: 'filter-ranger' }
+    else
+      return null
 
   onTabClicked: (e) ->
     @playSound 'game-menu-tab-switch'
     nano = $($(e.target).attr('href')).find('.nano')
     nano.nanoScroller({alwaysVisible: true})
     @paneNanoContent = nano.find('.nano-content')
-    @onScrollItemPane()
+    @showVisibleItemImages()
 
-  onScrollItemPane: ->
+  showVisibleItemImages: ->
     # dynamically load visible items when the user scrolls enough to see them
     return console.error "Couldn't update scroll, since paneNanoContent wasn't initialized." unless @paneNanoContent
     items = @paneNanoContent.find('.item:not(.loaded)')
@@ -172,15 +206,18 @@ module.exports = class PlayItemsModal extends ModalView
     tabContent = @$el.find('.tab-content')
     tabContent.removeClass('filter-wizard filter-ranger filter-warrior')
     tabContent.addClass("filter-#{value}") if value isnt 'all'
+    @updateViewVisibleTimer()
 
   onUnlockButtonClicked: (e) ->
     e.stopPropagation()
     button = $(e.target).closest('button')
     item = @idToItem[button.data('item-id')]
-    affordable = item.affordable
+    gemsOwned = me.gems()
+    cost = item.get('gems') ? 0
+    affordable = cost <= gemsOwned
     if not affordable
       @playSound 'menu-button-click'
-      @askToBuyGems button
+      @askToBuyGems button unless me.freeOnly() or application.getHocCampaign()
     else if button.hasClass('confirm')
       @playSound 'menu-button-unlock-end'
       purchase = Purchase.makeFor(item)
@@ -196,7 +233,9 @@ module.exports = class PlayItemsModal extends ModalView
 
       #- ...then rerender key bits
       @renderSelectors(".item[data-item-id='#{item.id}']", "#gems-count")
+      console.log('render selectors', ".item[data-item-id='#{item.id}']", "#gems-count")
       @itemDetailsView.render()
+      @showVisibleItemImages()
 
       Backbone.Mediator.publish 'store:item-purchased', item: item, itemSlug: item.get('slug')
     else
@@ -205,9 +244,14 @@ module.exports = class PlayItemsModal extends ModalView
       @$el.one 'click', (e) ->
         button.removeClass('confirm').text($.i18n.t('play.unlock')) if e.target isnt button[0]
 
+  onSubscribeButtonClicked: (e) ->
+    @openModalView new SubscribeModal()
+
+  askToSignUp: ->
+    createAccountModal = new CreateAccountModal supermodel: @supermodel
+    return @openModalView createAccountModal
+
   askToBuyGems: (unlockButton) ->
-    if me.getGemPromptGroup() is 'no-prompt'
-      return @openModalView new BuyGemsModal()
     @$el.find('.unlock-button').popover 'destroy'
     popoverTemplate = buyGemsPromptTemplate {}
     unlockButton.popover(
@@ -220,9 +264,11 @@ module.exports = class PlayItemsModal extends ModalView
     ).popover 'show'
     popover = unlockButton.data('bs.popover')
     popover?.$tip?.i18n()
+    @applyRTLIfNeeded()
 
   onBuyGemsPromptButtonClicked: (e) ->
     @playSound 'menu-button-click'
+    return @askToSignUp() if me.get('anonymous')
     @openModalView new BuyGemsModal()
 
   onClickedSomewhere: (e) ->

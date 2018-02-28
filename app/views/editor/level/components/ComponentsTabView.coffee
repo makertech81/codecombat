@@ -1,10 +1,11 @@
+require('app/styles/editor/level/components_tab.sass')
 CocoView = require 'views/core/CocoView'
 template = require 'templates/editor/level/components_tab'
 ThangType = require 'models/ThangType'
 LevelComponent = require 'models/LevelComponent'
 LevelComponentEditView = require './LevelComponentEditView'
 LevelComponentNewView = require './NewLevelComponentModal'
-require 'vendor/treema'
+require 'lib/setupTreema'
 
 class LevelComponentCollection extends Backbone.Collection
   url: '/db/level.component'
@@ -50,6 +51,10 @@ module.exports = class ComponentsTabView extends CocoView
       component = componentModelMap[comp.original]
       res = [(if comp.count then 0 else 1), component.get('system'), component.get('name')]
       return res
+
+    res = {}
+    res[treemaData[key].original] = treemaData[key] for key in [0 ... treemaData.length]
+    treemaData = (value for key, value of res)  # Removing duplicates from treemaData
 
     treemaOptions =
       supermodel: @supermodel

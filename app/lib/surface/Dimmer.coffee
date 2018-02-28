@@ -1,4 +1,5 @@
 CocoClass = require 'core/CocoClass'
+createjs = require 'lib/createjs-parts'
 
 module.exports = class Dimmer extends CocoClass
   subscriptions:
@@ -64,7 +65,7 @@ module.exports = class Dimmer extends CocoClass
   updateDimMask: =>
     @dimMask.graphics.clear()
     for thangID, sprite of @sprites
-      continue unless (thangID in @highlightedThangIDs) or sprite.isTalking?() or sprite.thang?.id is 'My Wizard'
+      continue unless (thangID in @highlightedThangIDs) or sprite.isTalking?()
       sup = x: sprite.sprite.x, y: sprite.sprite.y
       cap = @camera.surfaceToCanvas sup
       r = 50 * @camera.zoom  # TODO: find better way to get the radius based on the sprite's size

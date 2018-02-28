@@ -4,10 +4,25 @@ LevelLoader = require 'lib/LevelLoader'
 GoalManager = require 'lib/world/GoalManager'
 God = require 'lib/God'
 {createAetherOptions} = require 'lib/aether_utils'
+LZString = require 'lz-string'
+
+SIMULATOR_VERSION = 4
+
+simulatorInfo = {}
+if $.browser
+  simulatorInfo['desktop'] = $.browser.desktop if $.browser.desktop
+  simulatorInfo['name'] = $.browser.name if $.browser.name
+  simulatorInfo['platform'] = $.browser.platform if $.browser.platform
+  simulatorInfo['version'] = $.browser.versionNumber if $.browser.versionNumber
 
 module.exports = class Simulator extends CocoClass
   constructor: (@options) ->
     @options ?= {}
+    simulatorType = if @options.headlessClient then 'headless' else 'browser'
+    @simulator =
+      type: simulatorType
+      version: SIMULATOR_VERSION
+      info: simulatorInfo
     _.extend @, Backbone.Events
     @trigger 'statusUpdate', 'Starting simulation!'
     @retryDelayInSeconds = 2
@@ -28,17 +43,32 @@ module.exports = class Simulator extends CocoClass
       type: 'POST'
       parse: true
       data:
-        'humansGameID': humanGameID
-        'ogresGameID': ogresGameID
+        humansGameID: humanGameID
+        ogresGameID: ogresGameID
+        simulator: @simulator
+        background: Boolean(@options.background)
+        levelID: @options.levelID
+        leagueID: @options.leagueID
       error: (errorData) ->
         console.warn "There was an error fetching two games! #{JSON.stringify errorData}"
+        if errorData?.responseText?.indexOf("Old simulator") isnt -1
+          noty {
+            text: errorData.responseText
+            layout: 'center'
+            type: 'error'
+          }
       success: (taskData) =>
         return if @destroyed
         unless taskData
+          @retryDelayInSeconds = 10
           @trigger 'statusUpdate', "No games to simulate. Trying another game in #{@retryDelayInSeconds} seconds."
           @simulateAnotherTaskAfterDelay()
           return
-        @trigger 'statusUpdate', 'Setting up simulation...'
+        @simulatingPlayerStrings = {}
+        for team in ['humans', 'ogres']
+          session = _.find(taskData.sessions, {team: team})
+          @simulatingPlayerStrings[team] = "#{session.creatorName or session.creator} #{session.team}"
+        @trigger 'statusUpdate', "Setting up #{taskData.sessions[0].levelID} simulation between #{@simulatingPlayerStrings.humans} and #{@simulatingPlayerStrings.ogres}"
         #refactor this
         @task = new SimulationTask(taskData)
 
@@ -55,7 +85,7 @@ module.exports = class Simulator extends CocoClass
   simulateSingleGame: ->
     return if @destroyed
     @assignWorldAndLevelFromLevelLoaderAndDestroyIt()
-    @trigger 'statusUpdate', 'Simulating...'
+    @trigger 'statusUpdate', "Simulating match between #{@simulatingPlayerStrings.humans} and #{@simulatingPlayerStrings.ogres}"
     @setupGod()
     try
       @commenceSingleSimulation()
@@ -63,9 +93,9 @@ module.exports = class Simulator extends CocoClass
       @handleSingleSimulationError error
 
   commenceSingleSimulation: ->
-    Backbone.Mediator.subscribeOnce 'god:infinite-loop', @handleSingleSimulationInfiniteLoop, @
-    Backbone.Mediator.subscribeOnce 'god:goals-calculated', @processSingleGameResults, @
-    @god.createWorld @generateSpellsObject()
+    @listenToOnce @god, 'infinite-loop', @handleSingleSimulationInfiniteLoop
+    @listenToOnce @god, 'goals-calculated', @processSingleGameResults
+    @god.createWorld {spells: @generateSpellsObject()}
 
   handleSingleSimulationError: (error) ->
     console.error 'There was an error simulating a single game!', error
@@ -75,7 +105,7 @@ module.exports = class Simulator extends CocoClass
       process.exit(0)
     @cleanupAndSimulateAnotherTask()
 
-  handleSingleSimulationInfiniteLoop: ->
+  handleSingleSimulationInfiniteLoop: (e) ->
     console.log 'There was an infinite loop in the single game!'
     return if @destroyed
     if @options.headlessClient and @options.simulateOnlyOneGame
@@ -84,13 +114,11 @@ module.exports = class Simulator extends CocoClass
     @cleanupAndSimulateAnotherTask()
 
   processSingleGameResults: (simulationResults) ->
-    return console.error "Weird, we destroyed the Simulator before it processed results?" if @destroyed
     try
       taskResults = @formTaskResultsObject simulationResults
     catch error
       console.log "Failed to form task results:", error
       return @cleanupAndSimulateAnotherTask()
-    console.log 'Processing results:', taskResults
     humanSessionRank = taskResults.sessions[0].metrics.rank
     ogreSessionRank = taskResults.sessions[1].metrics.rank
     if @options.headlessClient and @options.simulateOnlyOneGame
@@ -105,7 +133,12 @@ module.exports = class Simulator extends CocoClass
       @sendSingleGameBackToServer(taskResults)
 
   sendSingleGameBackToServer: (results) ->
-    @trigger 'statusUpdate', 'Simulation completed, sending results back to server!'
+    status = 'Recording:'
+    for session in results.sessions
+      states = ['wins', if _.find(results.sessions, (s) -> s.metrics.rank is 0) then 'loses' else 'draws']
+      status += " #{session.name} #{states[session.metrics.rank]}"
+    console.log status
+    @trigger 'statusUpdate', status
 
     $.ajax
       url: '/queue/scoring/recordTwoGames'
@@ -118,6 +151,8 @@ module.exports = class Simulator extends CocoClass
 
   fetchAndSimulateTask: =>
     return if @destroyed
+    # Because there's some bug where the chained rankings don't work, let's just do getTwoGames until we fix it.
+    return @fetchAndSimulateOneGame()
 
     if @options.headlessClient
       if @dumpThisTime # The first heapdump would be useless to find leaks.
@@ -136,6 +171,7 @@ module.exports = class Simulator extends CocoClass
       parse: true
       error: @handleFetchTaskError
       success: @setupSimulationAndLoadLevel
+      cache: false
 
   handleFetchTaskError: (errorData) =>
     console.error "There was a horrible Error: #{JSON.stringify errorData}"
@@ -143,11 +179,11 @@ module.exports = class Simulator extends CocoClass
     @simulateAnotherTaskAfterDelay()
 
   handleNoGamesResponse: ->
+    @noTasks = true
     info = 'Finding game to simulate...'
     console.log info
     @trigger 'statusUpdate', info
     @fetchAndSimulateOneGame()
-    application.tracker?.trackEvent 'Simulator Result', label: 'No Games', ['Google Analytics']
 
   simulateAnotherTaskAfterDelay: =>
     console.log "Retrying in #{@retryDelayInSeconds}"
@@ -199,17 +235,24 @@ module.exports = class Simulator extends CocoClass
     @levelLoader = null
 
   setupGod: ->
-    @god.setLevel @level.serialize(@supermodel, @session, @otherSession)
+    @god.setLevel @level.serialize {@supermodel, @session, @otherSession, headless: true, sessionless: false}
     @god.setLevelSessionIDs (session.sessionID for session in @task.getSessions())
     @god.setWorldClassMap @world.classMap
-    @god.setGoalManager new GoalManager(@world, @level.get 'goals')
+    @god.setGoalManager new GoalManager @world, @level.get('goals'), null, {headless: true}
+    humanFlagHistory = _.filter @session.get('state')?.flagHistory ? [], (event) => event.source isnt 'code' and event.team is (@session.get('team') ? 'humans')
+    ogreFlagHistory = _.filter @otherSession.get('state')?.flagHistory ? [], (event) => event.source isnt 'code' and event.team is (@otherSession.get('team') ? 'ogres')
+    @god.lastFlagHistory = humanFlagHistory.concat ogreFlagHistory
+    #console.log 'got flag history', @god.lastFlagHistory, 'from', humanFlagHistory, ogreFlagHistory, @session.get('state'), @otherSession.get('state')
+    @god.lastSubmissionCount = 0  # TODO: figure out how to combine submissionCounts from both players so we can use submissionCount random seeds again.
+    @god.lastDifficulty = 0
 
   commenceSimulationAndSetupCallback: ->
-    Backbone.Mediator.subscribeOnce 'god:infinite-loop', @onInfiniteLoop, @
-    Backbone.Mediator.subscribeOnce 'god:goals-calculated', @processResults, @
-    @god.createWorld @generateSpellsObject()
+    @listenToOnce @god, 'infinite-loop', @onInfiniteLoop
+    @listenToOnce @god, 'goals-calculated', @processResults
+    @god.createWorld {spells: @generateSpellsObject()}
 
     # Search for leaks, headless-client only.
+    # NOTE: Memwatch currently being ignored by Webpack, because it's only used by the server.
     if @options.headlessClient and @options.leakTest and not @memwatch?
       leakcount = 0
       maxleakcount = 0
@@ -233,14 +276,13 @@ module.exports = class Simulator extends CocoClass
                 process.exit()
               @hd = new @memwatch.HeapDiff()
 
-  onInfiniteLoop: ->
+  onInfiniteLoop: (e) ->
     return if @destroyed
     console.warn 'Skipping infinitely looping game.'
     @trigger 'statusUpdate', "Infinite loop detected; grabbing a new game in #{@retryDelayInSeconds} seconds."
     _.delay @cleanupAndSimulateAnotherTask, @retryDelayInSeconds * 1000
 
   processResults: (simulationResults) ->
-    return console.error "Weird, we destroyed the Simulator before it processed results?" if @destroyed
     try
       taskResults = @formTaskResultsObject simulationResults
     catch error
@@ -275,14 +317,12 @@ module.exports = class Simulator extends CocoClass
 
   handleTaskResultsTransferSuccess: (result) =>
     return if @destroyed
-    console.log "Task registration result: #{JSON.stringify result}"
+    #console.log "Task registration result: #{JSON.stringify result}"
     @trigger 'statusUpdate', 'Results were successfully sent back to server!'
-    console.log 'Simulated by you:', @simulatedByYou
     @simulatedByYou++
     unless @options.headlessClient
       simulatedBy = parseInt($('#simulated-by-you').text(), 10) + 1
       $('#simulated-by-you').text(simulatedBy)
-    application.tracker?.trackEvent 'Simulator Result', label: 'Success', ['Google Analytics']
 
   handleTaskResultsTransferError: (error) =>
     return if @destroyed
@@ -292,9 +332,13 @@ module.exports = class Simulator extends CocoClass
   cleanupAndSimulateAnotherTask: =>
     return if @destroyed
     @cleanupSimulation()
-    @fetchAndSimulateTask()
+    if @options.background or @noTasks
+      @fetchAndSimulateOneGame()
+    else
+      @fetchAndSimulateTask()
 
   cleanupSimulation: ->
+    @stopListening @god
     @world = null
     @level = null
 
@@ -306,6 +350,8 @@ module.exports = class Simulator extends CocoClass
       originalSessionRank: -1
       calculationTime: 500
       sessions: []
+      simulator: @simulator
+      randomSeed: @task.world.randomSeed
 
     for session in @task.getSessions()
       sessionResult =
@@ -316,6 +362,7 @@ module.exports = class Simulator extends CocoClass
         totalScore: session.totalScore
         metrics:
           rank: @calculateSessionRank session.sessionID, simulationResults.goalStates, @task.generateTeamToSessionMap()
+        shouldUpdateLastOpponentSubmitDateForLeague: session.shouldUpdateLastOpponentSubmitDateForLeague
       if session.sessionID is taskResults.originalSessionID
         taskResults.originalSessionRank = sessionResult.metrics.rank
         taskResults.originalSessionTeam = session.team
@@ -340,81 +387,25 @@ module.exports = class Simulator extends CocoClass
       return 1
 
   generateSpellsObject: ->
-    @currentUserCodeMap = @task.generateSpellKeyToSourceMap()
-    @spells = {}
-    for thang in @level.attributes.thangs
-      continue if @thangIsATemplate thang
-      @generateSpellKeyToSourceMapPropertiesFromThang thang
-    @spells
-
-  thangIsATemplate: (thang) ->
-    for component in thang.components
-      continue unless @componentHasProgrammableMethods component
-      for methodName, method of component.config.programmableMethods
-        return true if @methodBelongsToTemplateThang method
-
-    return false
-
-  componentHasProgrammableMethods: (component) -> component.config? and _.has component.config, 'programmableMethods'
-
-  methodBelongsToTemplateThang: (method) -> typeof method is 'string'
-
-  generateSpellKeyToSourceMapPropertiesFromThang: (thang) =>
-    for component in thang.components
-      continue unless @componentHasProgrammableMethods component
-      for methodName, method of component.config.programmableMethods
-        spellKey = @generateSpellKeyFromThangIDAndMethodName thang.id, methodName
-
-        @createSpellAndAssignName spellKey, methodName
-        @createSpellThang thang, method, spellKey
-        @transpileSpell thang, spellKey, methodName
-
-  generateSpellKeyFromThangIDAndMethodName: (thang, methodName) ->
-    spellKeyComponents = [thang, methodName]
-    spellKeyComponents[0] = _.string.slugify spellKeyComponents[0]
-    spellKey = spellKeyComponents.join '/'
-    spellKey
-
-  createSpellAndAssignName: (spellKey, spellName) ->
-    @spells[spellKey] ?= {}
-    @spells[spellKey].name = spellName
-
-  createSpellThang: (thang, method, spellKey) ->
-    @spells[spellKey].thangs ?= {}
-    @spells[spellKey].thangs[thang.id] ?= {}
-    spellTeam = @task.getSpellKeyToTeamMap()[spellKey]
-    playerTeams = @task.getPlayerTeams()
-    useProtectAPI = true
-    if spellTeam not in playerTeams
-      useProtectAPI = false
-    else
-      spellSession = _.filter(@task.getSessions(), {team: spellTeam})[0]
-      unless codeLanguage = spellSession?.submittedCodeLanguage
-        console.warn 'Session', spellSession.creatorName, spellSession.team, 'didn\'t have submittedCodeLanguage, just:', spellSession
-    @spells[spellKey].thangs[thang.id].aether = @createAether @spells[spellKey].name, method, useProtectAPI, codeLanguage ? 'javascript'
-
-  transpileSpell: (thang, spellKey, methodName) ->
-    slugifiedThangID = _.string.slugify thang.id
-    generatedSpellKey = [slugifiedThangID,methodName].join '/'
-    source = @currentUserCodeMap[generatedSpellKey] ? ''
-    aether = @spells[spellKey].thangs[thang.id].aether
-    unless _.contains(@task.spellKeysToTranspile, generatedSpellKey)
-      aether.pure = source
-    else
+    spells = {}
+    for {hero, team} in [{hero: 'Hero Placeholder', team: 'humans'}, {hero: 'Hero Placeholder 1', team: 'ogres'}]
+      sessionInfo = _.filter(@task.getSessions(), {team: team})[0]
+      fullSpellName = _.string.slugify(hero) + '/plan'
+      submittedCodeLanguage = sessionInfo?.submittedCodeLanguage ? 'javascript'
+      submittedCodeLanguage = 'javascript' if submittedCodeLanguage in ['clojure', 'io']  # No longer supported
+      submittedCode = LZString.decompressFromUTF16 sessionInfo?.submittedCode?[_.string.slugify(hero)]?.plan ? ''
+      aether = new Aether createAetherOptions functionName: 'plan', codeLanguage: submittedCodeLanguage, skipProtectAPI: false
       try
-        aether.transpile source
+        aether.transpile submittedCode
       catch e
-        console.log "Couldn't transpile #{spellKey}:\n#{source}\n", e
+        console.log "Couldn't transpile #{fullSpellName}:\n#{submittedCode}\n", e
         aether.transpile ''
+      spells[fullSpellName] = name: 'plan', team: team, thang: {thang: {id: hero}, aether: aether}
+    spells
 
-  createAether: (methodName, method, useProtectAPI, codeLanguage) ->
-    aetherOptions = createAetherOptions functionName: methodName, codeLanguage: codeLanguage, skipProtectAPI: not useProtectAPI
-    return new Aether aetherOptions
 
 class SimulationTask
   constructor: (@rawData) ->
-    @spellKeyToTeamMap = {}
-    @spellKeysToTranspile = []
 
   getLevelName: ->
     levelName = @rawData.sessions?[0]?.levelID
@@ -442,52 +433,4 @@ class SimulationTask
 
   getSessions: -> @rawData.sessions
 
-  getSpellKeyToTeamMap: -> @spellKeyToTeamMap
-
-  getPlayerTeams: -> _.pluck @rawData.sessions, 'team'
-
   setWorld: (@world) ->
-
-  generateSpellKeyToSourceMap: ->
-    playerTeams = _.pluck @rawData.sessions, 'team'
-    spellKeyToSourceMap = {}
-    for session in @rawData.sessions
-      teamSpells = session.teamSpells[session.team]
-      allTeams = _.keys session.teamSpells
-      nonPlayerTeams = _.difference allTeams, playerTeams
-      for team in allTeams
-        for spell in session.teamSpells[team]
-          @spellKeyToTeamMap[spell] = team
-      for nonPlayerTeam in nonPlayerTeams
-        for spell in session.teamSpells[nonPlayerTeam]
-          spellKeyToSourceMap[spell] ?= @getWorldProgrammableSource(spell, @world)
-          @spellKeysToTranspile.push spell
-      teamCode = {}
-
-      for thangName, thangSpells of session.transpiledCode
-        for spellName, spell of thangSpells
-          fullSpellName = [thangName, spellName].join '/'
-          if _.contains(teamSpells, fullSpellName)
-            teamCode[fullSpellName]=spell
-
-      _.merge spellKeyToSourceMap, teamCode
-
-    spellKeyToSourceMap
-
-  getWorldProgrammableSource: (desiredSpellKey ,world) ->
-    programmableThangs = _.filter world.thangs, 'isProgrammable'
-    @spells ?= {}
-    @thangSpells ?= {}
-    for thang in programmableThangs
-      continue if @thangSpells[thang.id]?
-      @thangSpells[thang.id] = []
-      for methodName, method of thang.programmableMethods
-        pathComponents = [thang.id, methodName]
-        if method.cloneOf
-          pathComponents[0] = method.cloneOf  # referencing another Thang's method
-        pathComponents[0] = _.string.slugify pathComponents[0]
-        spellKey = pathComponents.join '/'
-        @thangSpells[thang.id].push spellKey
-        if not method.cloneOf and spellKey is desiredSpellKey
-          #console.log "Setting #{desiredSpellKey} from world!"
-          return method.source

@@ -2,6 +2,7 @@ Bus = require './Bus'
 {me} = require 'core/auth'
 LevelSession = require 'models/LevelSession'
 utils = require 'core/utils'
+tagger = require 'lib/SolutionConceptTagger'
 
 module.exports = class LevelBus extends Bus
 
@@ -10,8 +11,6 @@ module.exports = class LevelBus extends Bus
     return Bus.getFromCache(docName) or new LevelBus docName
 
   subscriptions:
-    'self-wizard:target-changed': 'onSelfWizardTargetChanged'
-    'self-wizard:created': 'onSelfWizardCreated'
     'tome:editing-began': 'onEditingBegan'
     'tome:editing-ended': 'onEditingEnded'
     'script:state-changed': 'onScriptStateChanged'
@@ -22,6 +21,7 @@ module.exports = class LevelBus extends Bus
     'tome:spell-changed': 'onSpellChanged'
     'tome:spell-created': 'onSpellCreated'
     'tome:cast-spells': 'onCastSpells'
+    'tome:winnability-updated': 'onWinnabilityUpdated'
     'application:idle-changed': 'onIdleChanged'
     'goal-manager:new-goal-states': 'onNewGoalStates'
     'god:new-world-created': 'onNewWorldCreated'
@@ -29,10 +29,12 @@ module.exports = class LevelBus extends Bus
   constructor: ->
     super(arguments...)
     @changedSessionProperties = {}
-    if document.location.href.search('codecombat.com') isnt -1
-      @saveSession = _.debounce(@reallySaveSession, 4000, {maxWait: 10000})  # Save slower on production.
-    else
-      @saveSession = _.debounce(@reallySaveSession, 1000, {maxWait: 5000})  # Save quickly in development.
+    saveDelay = window.serverConfig?.sessionSaveDelay
+    [wait, maxWait] = switch
+      when not application.isProduction or not saveDelay then [1, 5]  # Save quickly in development.
+      when me.isAnonymous() then [saveDelay.anonymous.min, saveDelay.anonymous.max]
+      else [saveDelay.registered.min, saveDelay.registered.max]
+    @saveSession = _.debounce @reallySaveSession, wait * 1000, {maxWait: maxWait * 1000}
     @playerIsIdle = false
 
   init: ->
@@ -40,7 +42,6 @@ module.exports = class LevelBus extends Bus
     @fireScriptsRef = @fireRef?.child('scripts')
 
   setSession: (@session) ->
-    @listenTo(@session, 'change:multiplayer', @onMultiplayerChanged)
     @timerIntervalID = setInterval(@incrementSessionPlaytime, 1000)
 
   onIdleChanged: (e) ->
@@ -52,30 +53,15 @@ module.exports = class LevelBus extends Bus
     @session.set('playtime', (@session.get('playtime') ? 0) + 1)
 
   onPoint: ->
-    return true unless @session?.get('multiplayer')
-    super()
-
-  onSelfWizardCreated: (e) ->
-    @selfWizardLank = e.sprite
-
-  onSelfWizardTargetChanged: (e) ->
-    @wizardRef?.child('targetPos').set(@selfWizardLank?.targetPos or null)
-    @wizardRef?.child('targetSprite').set(@selfWizardLank?.targetSprite?.thang.id or null)
+    return true
 
   onMeSynced: =>
     super()
-    @wizardRef?.child('wizardColor1').set(me.get('wizardColor1') or 0.0)
 
   join: ->
     super()
-    @wizardRef = @myConnection.child('wizard')
-    @wizardRef?.child('targetPos').set(@selfWizardLank?.targetPos or null)
-    @wizardRef?.child('targetSprite').set(@selfWizardLank?.targetSprite?.thang.id or null)
-    @wizardRef?.child('wizardColor1').set(me.get('wizardColor1') or 0.0)
 
   disconnect: ->
-    @wizardRef?.off()
-    @wizardRef = null
     @fireScriptsRef?.off()
     @fireScriptsRef = null
     super()
@@ -88,8 +74,8 @@ module.exports = class LevelBus extends Bus
 
   # UPDATING FIREBASE AND SESSION
 
-  onEditingBegan: -> @wizardRef?.child('editing').set(true)
-  onEditingEnded: -> @wizardRef?.child('editing').set(false)
+  onEditingBegan: -> #@wizardRef?.child('editing').set(true)  # no more wizards
+  onEditingEnded: -> #@wizardRef?.child('editing').set(false)  # no more wizards
 
   # HACK: Backbone does not work with nested documents, but we want to
   #   patch only those props that have changed. Look into plugins to
@@ -135,6 +121,12 @@ module.exports = class LevelBus extends Bus
     @changedSessionProperties.state = true
     @saveSession()
 
+  onWinnabilityUpdated: (e) ->
+    return unless @onPoint() and e.winnable
+    return unless e.level.get('slug') in ['ace-of-coders', 'elemental-wars', 'the-battle-of-sky-span', 'tesla-tesoro', 'escort-duty']  # Mirror matches don't otherwise show victory, so we win here.
+    return if @session.get('state')?.complete
+    @onVictory()
+
   onNewWorldCreated: (e) ->
     return unless @onPoint()
     # Record the flag history.
@@ -150,7 +142,7 @@ module.exports = class LevelBus extends Bus
     return unless @onPoint()
     @fireScriptsRef?.update(e)
     state = @session.get('state')
-    scripts = state.scripts
+    scripts = state.scripts ? {}
     scripts.currentScript = e.currentScript
     scripts.currentScriptOffset = e.currentScriptOffset
     @changedSessionProperties.state = true
@@ -243,17 +235,14 @@ module.exports = class LevelBus extends Bus
     @changedSessionProperties.chat = true
     @saveSession()
 
-  onMultiplayerChanged: ->
-    @changedSessionProperties.multiplayer = true
-    @session.updatePermissions()
-    @changedSessionProperties.permissions = true
-    @saveSession()
-
   # Debounced as saveSession
   reallySaveSession: ->
     return if _.isEmpty @changedSessionProperties
     # don't let peeking admins mess with the session accidentally
-    return unless @session.get('multiplayer') or @session.get('creator') is me.id
+    return unless @session.get('creator') is me.id
+    return if @session.fake
+    if @changedSessionProperties.code
+      @updateSessionConcepts()
     Backbone.Mediator.publish 'level:session-will-save', session: @session
     patch = {}
     patch[prop] = @session.get(prop) for prop of @changedSessionProperties
@@ -263,6 +252,21 @@ module.exports = class LevelBus extends Bus
     # don't let what the server returns overwrite changes since the save began
     tempSession = new LevelSession _id: @session.id
     tempSession.save(patch, {patch: true, type: 'PUT'})
+    
+  updateSessionConcepts: ->
+    return unless @session.get('codeLanguage') in ['javascript', 'python']
+    try
+      tags = tagger({ast: @session.lastAST, language: @session.get('codeLanguage')})
+      tags = _.without(tags, 'basic_syntax')
+      @session.set('codeConcepts', tags)
+      @changedSessionProperties.codeConcepts = true
+    catch e
+      # Just in case the concept tagger system breaks. Esper needed fixing to handle
+      # the Python skulpt AST, the concept tagger is not fully tested, and this is a
+      # critical piece of code, so want to make sure this can fail gracefully.
+      console.error('Unable to parse concepts from this AST.')
+      console.error(e)
+      
 
   destroy: ->
     clearInterval(@timerIntervalID)

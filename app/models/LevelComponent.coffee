@@ -15,8 +15,11 @@ module.exports = class LevelComponent extends CocoModel
   @ProgrammableID: '524b7b5a7fc0f6d51900000e'
   @MovesID: '524b7b8c7fc0f6d519000013'
   @MissileID: '524cc2593ea855e0ab000142'
-  @FindsPaths: '52872b0ead92b98561000002'
+  @FindsPathsID: '52872b0ead92b98561000002'
+  @AttackableID: '524b7bab7fc0f6d519000017'
+  @RefereeID: '54977ce657e90bd1903dea72'
   urlRoot: '/db/level.component'
+  editableByArtisans: true
 
   set: (key, val, options) ->
     if _.isObject key

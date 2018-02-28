@@ -12,6 +12,10 @@
     display: none
   #gold-view
     right: 1%
+  #duel-stats-view
+    right: 115px
+    bottom: 80px
+    @include scale(1.5)
   
   #control-bar-view
     width: 100%
@@ -25,15 +29,10 @@
       width: 60%
       text-align: center
 
-  max-width: 1920px
   margin: 0 auto
   @include user-select(none)
   
-  #level-loading-view
-    max-height: 1284px
-
   .level-content
-    //max-width: 1920px
     position: relative
     margin: 0px auto
 
@@ -130,6 +129,7 @@
     left: 0
     right: 0
     background: linear-gradient(to top, rgba(0,0,0,0) 0%,rgba(0,0,0,0.8*$GI) 100%)
+    z-index: 4
 
   #hud-left-gradient
     background: linear-gradient(to right, rgba(0,0,0,$GI) 0%,rgba(0,0,0,0) 100%)

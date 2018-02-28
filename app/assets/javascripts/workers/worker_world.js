@@ -43,7 +43,7 @@ var console = {
       var args = [].slice.call(arguments);
       for(var i = 0; i < args.length; ++i) {
         if(args[i] && args[i].constructor) {
-          if(args[i].constructor.className === "Thang" || args[i].isComponent)
+          if(args[i].constructor.className === "Thang" || args[i].isComponent || args[i].isVector || args[i].isRectangle || args[i].isEllipse)
             args[i] = args[i].toString();
         }
       }
@@ -63,13 +63,25 @@ var console = {
 console.error = console.warn = console.info = console.debug = console.log;
 self.console = console;
 
+// Webpack TODO: Cache-bust these! (especially world.js)
 self.importScripts('/javascripts/lodash.js', '/javascripts/world.js', '/javascripts/aether.js');
+try {
+  //Detect very modern javascript support.
+  (0,eval("'use strict'; let test = WeakMap && (class Test { *gen(a=7) { yield yield * () => true ; } });"));
+  console.log("Modern javascript detected, aw yeah!");
+  self.importScripts('/javascripts/esper.modern.js');
+} catch (e) {
+  console.log("Legacy javascript detected, falling back...", e.message);
+  self.importScripts('/javascripts/esper.js');
+}
+
+
 var myImportScripts = importScripts;
 
 var languagesImported = {};
 var ensureLanguageImported = function(language) {
   if (languagesImported[language]) return;
-  if (language === 'javascript') return;  // Only has JSHint, but we don't need to lint here.
+  if (language === 'javascript' || language === 'html') return;  // Only has JSHint, but we don't need to lint here.
   myImportScripts("/javascripts/app/vendor/aether-" + language + ".js");
   languagesImported[language] = true;
 };
@@ -84,11 +96,6 @@ var ensureLanguagesImportedFromUserCodeMap = function (userCodeMap) {
 
 
 var restricted = ["XMLHttpRequest", "Worker"];
-if (!self.navigator || !(self.navigator.userAgent.indexOf('MSIE') > 0) && 
-    !self.navigator.userAgent.match(/Trident.*rv\:11\./)) {
-  // Can't restrict 'importScripts' in IE11, skip for all IE versions
-  restricted.push("importScripts");
-}
 for(var i = 0; i < restricted.length; ++i) {
   // We could do way more from this: http://stackoverflow.com/questions/10653809/making-webworkers-a-safe-environment
   Object.defineProperty(self, restricted[i], {
@@ -110,18 +117,18 @@ self.transferableSupported = function transferableSupported() {
   return self._transferableSupported = false;
 };
 
-var World = self.require('lib/world/world');
-var GoalManager = self.require('lib/world/GoalManager');
+var World = self.libWorldRequire('lib/world/world');
+var GoalManager = self.libWorldRequire('lib/world/GoalManager');
 
-Aether.addGlobal('Vector', require('lib/world/vector'));
+Aether.addGlobal('Vector', self.libWorldRequire('lib/world/vector'));
 Aether.addGlobal('_', _);
 
 var serializedClasses = {
-    "Thang": self.require('lib/world/thang'),
-    "Vector": self.require('lib/world/vector'),
-    "Rectangle": self.require('lib/world/rectangle'),
-    "Ellipse": self.require('lib/world/ellipse'),
-    "LineSegment": self.require('lib/world/line_segment')
+    "Thang": self.libWorldRequire('lib/world/thang'),
+    "Vector": self.libWorldRequire('lib/world/vector'),
+    "Rectangle": self.libWorldRequire('lib/world/rectangle'),
+    "Ellipse": self.libWorldRequire('lib/world/ellipse'),
+    "LineSegment": self.libWorldRequire('lib/world/line_segment')
 };
 self.currentUserCodeMapCopy = "";
 self.currentDebugWorldFrame = 0;
@@ -279,12 +286,13 @@ self.retrieveValueFromFrame = function retrieveValueFromFrame(args) {
 self.enableFlowOnThangSpell = function (thangID, spellID, userCodeMap) {
     try {
         var options = userCodeMap[thangID][spellID].originalOptions;
-        if (options.includeFlow === true && options.noSerializationInFlow === true)
+        if (options.includeFlow === true && options.noSerializationInFlow === true && options.noVariablesInFlow === false)
             return;
         else
         {
             options.includeFlow = true;
             options.noSerializationInFlow = true;
+            options.noVariablesInFlow = false;
             var temporaryAether = Aether.deserialize(userCodeMap[thangID][spellID]);
             temporaryAether.transpile(temporaryAether.raw);
             userCodeMap[thangID][spellID] = temporaryAether.serialize();
@@ -310,8 +318,11 @@ self.setupDebugWorldToRunUntilFrame = function (args) {
             self.debugWorld = new World(args.userCodeMap);
             self.debugWorld.levelSessionIDs = args.levelSessionIDs;
             self.debugWorld.submissionCount = args.submissionCount;
+            self.debugWorld.fixedSeed = args.fixedSeed;
             self.debugWorld.flagHistory = args.flagHistory;
+            self.debugWorld.realTimeInputEvents = args.realTimeInputEvents;
             self.debugWorld.difficulty = args.difficulty;
+            self.debugWorld.language = args.language || 'en-US';
             if (args.level)
                 self.debugWorld.loadFromLevel(args.level, true);
             self.debugWorld.debugging = true;
@@ -371,13 +382,19 @@ self.runWorld = function runWorld(args) {
     self.world = new World(args.userCodeMap);
     self.world.levelSessionIDs = args.levelSessionIDs;
     self.world.submissionCount = args.submissionCount;
+    self.world.fixedSeed = args.fixedSeed;
     self.world.flagHistory = args.flagHistory || [];
+    self.world.realTimeInputEvents = args.realTimeInputEvents || [];
     self.world.difficulty = args.difficulty || 0;
+    self.world.language = args.language || 'en-US';
     if(args.level)
       self.world.loadFromLevel(args.level, true);
     self.world.preloading = args.preload;
     self.world.headless = args.headless;
     self.world.realTime = args.realTime;
+    self.world.indefiniteLength = args.indefiniteLength;
+    self.world.justBegin = args.justBegin;
+    self.world.keyValueDb = args.keyValueDb;
     self.goalManager = new GoalManager(self.world);
     self.goalManager.setGoals(args.goals);
     self.goalManager.setCode(args.userCodeMap);
@@ -404,27 +421,41 @@ self.serializeFramesSoFar = function serializeFramesSoFar() {
   self.world.framesSerializedSoFar = self.world.frames.length;
 };
 
-self.onWorldLoaded = function onWorldLoaded() {
-  if(self.world.framesSerializedSoFar == self.world.frames.length) return;
-  if(self.world.ended)
-    self.goalManager.worldGenerationEnded();
-  var goalStates = self.goalManager.getGoalStates();
-  var overallStatus = self.goalManager.checkOverallStatus();
-  if(self.world.ended)
-    self.postMessage({type: 'end-load-frames', goalStates: goalStates, overallStatus: overallStatus});
-  var t1 = new Date();
-  var diff = t1 - self.t0;
-  if(self.world.headless)
-    return console.log('Headless simulation completed in ' + diff + 'ms.');
-
-  var worldEnded = self.world.ended;
-  var totalFrames = self.world.totalFrames;
-  var transferableSupported = self.transferableSupported();
+function trySerialize() {
   try {
     var serialized = self.world.serialize();
   }
   catch(error) {
     console.log("World serialization error:", error.toString() + "\n" + error.stack || error.stackTrace);
+    return false;
+  }
+  return serialized;
+}
+
+self.onWorldLoaded = function onWorldLoaded() {
+  if(self.world.framesSerializedSoFar == self.world.frames.length) return;
+  if(self.world.ended)
+    self.goalManager.worldGenerationEnded();
+  var t1 = new Date();
+  var diff = t1 - self.t0;
+  var goalStates = self.goalManager.getGoalStates();
+  var totalFrames = self.world.totalFrames;
+  if(self.world.indefiniteLength) {
+    totalFrames = self.world.frames.length;
+  }
+  if(self.world.ended) {
+    var overallStatus = self.goalManager.checkOverallStatus();
+    var lastFrameHash = self.world.frames[totalFrames - 2].hash
+    var simulationFrameRate = self.world.frames.length / diff * 1000 * 30 / self.world.frameRate
+    self.postMessage({type: 'end-load-frames', goalStates: goalStates, overallStatus: overallStatus, totalFrames: totalFrames, lastFrameHash: lastFrameHash, simulationFrameRate: simulationFrameRate});
+    if(self.world.headless)
+      return console.log('Headless simulation completed in ' + diff + 'ms, ' + simulationFrameRate.toFixed(1) + ' FPS.');
+  }
+
+  var worldEnded = self.world.ended;
+  var serialized;
+  var transferableSupported = self.transferableSupported();
+  if ( !( serialized = trySerialize()) ) {
     self.destroyWorld();
     return;
   }
@@ -450,7 +481,7 @@ self.onWorldLoaded = function onWorldLoaded() {
 
   if(worldEnded) {
     var t3 = new Date();
-    console.log("And it was so: (" + (diff / totalFrames).toFixed(3) + "ms per frame,", totalFrames, "frames)\nSimulation   :", diff + "ms \nSerialization:", (t2 - t1) + "ms\nDelivery     :", (t3 - t2) + "ms");
+    console.log("And it was so: (" + (diff / totalFrames).toFixed(3) + "ms per frame,", totalFrames, "frames)\nSimulation   :", diff + "ms \nSerialization:", (t2 - t1) + "ms\nDelivery     :", (t3 - t2) + "ms\nFPS          :", simulationFrameRate.toFixed(1));
   }
 };
 
@@ -464,7 +495,10 @@ self.onWorldPreloaded = function onWorldPreloaded() {
   self.goalManager.worldGenerationEnded();
   var goalStates = self.goalManager.getGoalStates();
   var overallStatus = self.goalManager.checkOverallStatus();
-  self.postMessage({type: 'end-preload-frames', goalStates: goalStates, overallStatus: overallStatus});
+  var t1 = new Date();
+  var diff = t1 - self.t0;
+  var simulationFrameRate = self.world.frames.length / diff * 1000 * 30 / self.world.frameRate
+  self.postMessage({type: 'end-preload-frames', goalStates: goalStates, overallStatus: overallStatus, simulationFrameRate: simulationFrameRate});
 };
 
 self.onWorldError = function onWorldError(error) {
@@ -477,7 +511,13 @@ self.onWorldError = function onWorldError(error) {
   }
   else {
     console.log("Non-UserCodeError:", error.toString() + "\n" + error.stack || error.stackTrace);
+    if(self.world.indefiniteLength) {
+      // We don't abort completely, since the player can always click to end the game.
+      // TODO: some better error to the user would be nice, though.
+      return true;
+    }
     self.postMessage({type: 'non-user-code-problem', problem: {message: error.toString()}});
+    return false;
   }
   /*  We don't actually have the recoverable property any more; hmm
   if(!error.recoverable) {
@@ -513,6 +553,11 @@ self.finalizePreload = function finalizePreload() {
 self.addFlagEvent = function addFlagEvent(flagEvent) {
   if(!self.world) return;
   self.world.addFlagEvent(flagEvent);
+};
+
+self.addRealTimeInputEvent = function addRealTimeInputEvent(realTimeInputEvent) {
+  if(!self.world) return;
+  self.world.addRealTimeInputEvent(realTimeInputEvent);
 };
 
 self.stopRealTimePlayback = function stopRealTimePlayback() {

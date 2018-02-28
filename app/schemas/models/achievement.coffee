@@ -19,13 +19,14 @@ MongoFindQuerySchema =
   title: 'Query'
   type: 'object'
   patternProperties:
-    '^[-a-zA-Z0-9.]*$':
+    '^[-a-zA-Z0-9._]*$':
       anyOf: [
         {$ref: '#/definitions/mongoQueryOperator'},
         {type: 'string'}
         {type: 'object'}
         {type: 'boolean'}
       ]
+  properties: {}
   additionalProperties: false
   definitions: {}
 
@@ -66,7 +67,7 @@ _.extend AchievementSchema.properties,
     type: 'object'
     description: 'Function that gives total experience for X amount achieved'
     properties:
-      kind: {enum: ['linear', 'logarithmic', 'quadratic'] }
+      kind: {enum: ['linear', 'logarithmic', 'quadratic', 'pow'] }
       parameters:
         type: 'object'
         default: { a: 1, b: 0, c: 0 }
@@ -80,6 +81,8 @@ _.extend AchievementSchema.properties,
     additionalProperties: false
   i18n: {type: 'object', format: 'i18n', props: ['name', 'description'], description: 'Help translate this achievement'}
   rewards: c.RewardSchema 'awarded by this achievement'
+  hidden: {type: 'boolean', description: 'Hide achievement from user if true'}
+  updated: c.stringDate({ description: 'When the achievement was changed in such a way that earned achievements should get updated.' })
 
 
 _.extend AchievementSchema, # Let's have these on the bottom

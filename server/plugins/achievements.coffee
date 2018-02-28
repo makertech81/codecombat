@@ -1,5 +1,5 @@
 mongoose = require 'mongoose'
-EarnedAchievement = require '../achievements/EarnedAchievement'
+EarnedAchievement = require '../models/EarnedAchievement'
 LocalMongo = require '../../app/lib/LocalMongo'
 util = require '../../app/core/utils'
 log = require 'winston'
@@ -9,8 +9,8 @@ log = require 'winston'
 # TODO if this is still a common scenario I could implement a database hit after all, but only
 # on the condition that it's necessary and still not too frequent in occurrence
 AchievablePlugin = (schema, options) ->
-  User = require '../users/User'  # Avoid mutual inclusion cycles
-  Achievement = require '../achievements/Achievement'
+  User = require '../models/User'  # Avoid mutual inclusion cycles
+  Achievement = require '../models/Achievement'
 
   # Keep track the document before it's saved
   schema.post 'init', (doc) ->
@@ -19,25 +19,36 @@ AchievablePlugin = (schema, options) ->
 
   # Check if an achievement has been earned
   schema.post 'save', (doc) ->
-    isNew = not doc.isInit('_id') or not doc.unchangedCopy
+    promises = schema.statics.createNewEarnedAchievements(doc)
+    if global.testing
+      # Provide a way for tests to know when achievements have been earned
+      doc.achievementsEarning ?= []
+      doc.achievementsEarning = doc.achievementsEarning.concat(promises)
 
-    if doc.isInit('_id') and not doc.unchangedCopy
+  schema.statics.createNewEarnedAchievements = (doc, unchangedCopy) ->
+    unchangedCopy ?= doc.unchangedCopy
+    isNew = not doc.isInit('_id') or not unchangedCopy
+
+    if doc.isInit('_id') and not unchangedCopy
       log.warn 'document was already initialized but did not go through `init` and is therefore treated as new while it might not be'
 
     category = doc.constructor.collection.name
     loadedAchievements = Achievement.getLoadedAchievements()
-    #log.debug 'about to save ' + category + ', number of achievements is ' + Object.keys(loadedAchievements).length
+    promises = []
 
     if category of loadedAchievements
+      #log.debug 'about to save ' + category + ', number of achievements is ' + loadedAchievements[category].length
       docObj = doc.toObject()
       for achievement in loadedAchievements[category]
         do (achievement) ->
           query = achievement.get('query')
-          return log.warn("Empty achievement query for #{achievement.get('name')}.") if _.isEmpty query
+          return log.error("Empty achievement query for #{achievement.get('name')}.") if _.isEmpty query
           isRepeatable = achievement.get('proportionalTo')?
-          alreadyAchieved = if isNew then false else LocalMongo.matchesQuery doc.unchangedCopy, query
+          alreadyAchieved = if isNew then false else LocalMongo.matchesQuery unchangedCopy, query
           newlyAchieved = LocalMongo.matchesQuery(docObj, query)
           return unless newlyAchieved and (not alreadyAchieved or isRepeatable)
-          EarnedAchievement.createForAchievement(achievement, doc, doc.unchangedCopy)
+          promises.push EarnedAchievement.createForAchievement(achievement, doc, {originalDocObj: unchangedCopy})
+          
+    return promises
 
 module.exports = AchievablePlugin

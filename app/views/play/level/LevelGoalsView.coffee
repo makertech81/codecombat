@@ -1,7 +1,11 @@
+require('app/styles/play/level/goals.sass')
 CocoView = require 'views/core/CocoView'
 template = require 'templates/play/level/goals'
 {me} = require 'core/auth'
 utils = require 'core/utils'
+LevelSession = require 'models/LevelSession'
+Level = require 'models/Level'
+LevelConstants = require 'lib/LevelConstants'
 
 stateIconMap =
   success: 'glyphicon-ok'
@@ -12,14 +16,17 @@ module.exports = class LevelGoalsView extends CocoView
   template: template
   className: 'secret expanded'
   playbackEnded: false
-  mouseEntered: false
+  topScores: {}
 
   subscriptions:
     'goal-manager:new-goal-states': 'onNewGoalStates'
     'tome:cast-spells': 'onTomeCast'
     'level:set-letterbox': 'onSetLetterbox'
+    'level:set-playing': 'onSetPlaying'
     'surface:playback-restarted': 'onSurfacePlaybackRestarted'
     'surface:playback-ended': 'onSurfacePlaybackEnded'
+    'level:scores-updated': 'onScoresUpdated'
+    'level:top-scores-updated': 'onTopScoresUpdated'
 
   events:
     'mouseenter': ->
@@ -30,13 +37,19 @@ module.exports = class LevelGoalsView extends CocoView
       @mouseEntered = false
       @updatePlacement()
 
+  constructor: (options) ->
+    super options
+    @level = options.level
+    @updateTopScores LevelSession.getTopScores({session: options.session.toJSON(), level: @level.toJSON()})
+
   onNewGoalStates: (e) ->
     firstRun = not @previousGoalStatus?
     @previousGoalStatus ?= {}
     @$el.find('.goal-status').addClass 'secret'
+    @succeeded = e.overallStatus is 'success'
     classToShow = null
-    classToShow = 'success' if e.overallStatus is 'success'
-    classToShow = 'failure' if e.overallStatus is 'failure'
+    classToShow = 'success' if @succeeded
+    classToShow = 'incomplete' if e.overallStatus is 'failure'
     classToShow ?= 'timed-out' if e.timedOut
     classToShow ?= 'incomplete'
     @$el.find('.goal-status.'+classToShow).removeClass 'secret'
@@ -45,6 +58,7 @@ module.exports = class LevelGoalsView extends CocoView
     goals = []
     for goal in e.goals
       state = e.goalStates[goal.id]
+      continue if goal.optional and @level.isType('course') and state.status isnt 'success'
       if goal.hiddenGoal
         continue if goal.optional and state.status isnt 'success'
         continue if not goal.optional and state.status isnt 'failure'
@@ -84,6 +98,13 @@ module.exports = class LevelGoalsView extends CocoView
     @$el.find('.goal-status').addClass('secret')
     @$el.find('.goal-status.running').removeClass('secret')
 
+  onSetPlaying: (e) ->
+    return unless e.playing
+    # Automatically hide it while we replay
+    @mouseEntered = false
+    @expanded = true
+    @updatePlacement()
+
   onSurfacePlaybackRestarted: ->
     @playbackEnded = false
     @$el.removeClass 'brighter'
@@ -91,13 +112,14 @@ module.exports = class LevelGoalsView extends CocoView
     @updatePlacement()
 
   onSurfacePlaybackEnded: ->
+    return if @level.isType('game-dev')
     @playbackEnded = true
     @updateHeight()
     @$el.addClass 'brighter'
     @lastSizeTweenTime = new Date()
     @updatePlacement()
     if @soundToPlayWhenPlaybackEnded
-      Backbone.Mediator.publish 'audio-player:play-sound', trigger: @soundToPlayWhenPlaybackEnded, volume: 1
+      @playSound @soundToPlayWhenPlaybackEnded
 
   updateHeight: ->
     return if @$el.hasClass('brighter') or @$el.hasClass('secret')
@@ -105,11 +127,19 @@ module.exports = class LevelGoalsView extends CocoView
     @normalHeight = @$el.outerHeight()
 
   updatePlacement: ->
-    expand = @playbackEnded or @mouseEntered
+    # Expand it if it's at the end. Mousing over reverses this.
+    expand = @playbackEnded isnt @mouseEntered
     return if expand is @expanded
     @updateHeight()
     sound = if expand then 'goals-expand' else 'goals-collapse'
-    top = if expand then -5 else 41 - (@normalHeight ? @$el.outerHeight())
+    if expand
+      top = -5
+    else
+      height = @normalHeight
+      height = @$el.outerHeight() if not height or @playbackEnded
+      top = 41 - height
+      if @shouldShowScores()
+        top += 20
     @$el.css 'top', top
     if @soundTimeout
       # Don't play the sound we were going to play after all; the transition has reversed.
@@ -122,9 +152,66 @@ module.exports = class LevelGoalsView extends CocoView
 
   playToggleSound: (sound) =>
     return if @destroyed
-    Backbone.Mediator.publish 'audio-player:play-sound', trigger: sound, volume: 1
+    @playSound sound unless @options.level.isType('game-dev')
     @soundTimeout = null
 
   onSetLetterbox: (e) ->
     @$el.toggle not e.on
     @updatePlacement()
+
+  # Score display
+
+  shouldShowScores: ->
+    shouldShow = @level.get('assessment') in ['open-ended'] and @hasMainScore
+    if shouldShow isnt @showingScores
+      @showingScores = shouldShow
+      @$el.toggleClass 'with-scores', shouldShow
+    shouldShow
+
+  onScoresUpdated: (e) ->
+    mainScore = e.scores?[0]  # Current interface is only set up to display one score; first one is the most important.
+    if mainScore?.type is 'code-length' and not mainScore.score
+      mainScore = null  # Not counted until complete
+    @hasMainScore = mainScore?
+    return unless @shouldShowScores()
+    $scoreboard = @$('.scoreboard')
+    $scoreboard.toggleClass 'success', @succeeded
+    utils.replaceText $scoreboard.find('.score-type'), $.i18n.t("leaderboard.#{mainScore.type.replace(/-/g, '_')}")
+    scoreText = @formatScore mainScore.type, mainScore.score, false
+    utils.replaceText $scoreboard.find('.current-score-value'), scoreText
+    bestScore = @topScores[mainScore.type]
+    if bestScore?
+      if mainScore.type in LevelConstants.lowerIsBetterScoreTypes
+        showBest = bestScore < mainScore.score
+      else
+        showBest = bestScore > mainScore.score
+    @$el.toggleClass 'with-best-score', showBest
+    $scoreboard.find('.best-score').toggleClass 'hidden', not showBest
+    if showBest
+      bestScoreText = @formatScore mainScore.type, bestScore, true
+      utils.replaceText $scoreboard.find('.best-score-value'), bestScoreText
+    thresholdAchieved = Level.thresholdForScore({
+      type: mainScore.type,
+      score: bestScore ? mainScore.score
+      level: @level.toJSON()
+    })
+    if thresholdAchieved
+      @$('.threshold-icon').attr('src', "/images/pages/courses/star-#{thresholdAchieved}.png").toggleClass 'achieved', true
+    else
+      @$('.threshold-icon').toggleClass 'achieved', false
+
+  formatScore: (type, score, isBest) ->
+    switch type
+      when 'time', 'survival-time'
+        if isBest
+          score.toFixed(1)
+        else
+          "#{score.toFixed(1)} #{$.i18n.t 'units.sec'}"
+      else Math.round score
+
+  onTopScoresUpdated: (e) ->
+    @updateTopScores e.scores
+
+  updateTopScores: (scores) ->
+    for score in scores
+      @topScores[score.type] = score.score

@@ -95,9 +95,9 @@
   .leaderboard-tab-content
     position: absolute
     left: 219px
-    top: 21px
+    top: 55px
     width: 571px
-    height: 514px
+    height: 490px
     padding: 50px
     overflow-y: scroll
 
@@ -106,3 +106,14 @@
     // Wish we could easily do this for Firefox.
     display: none
 
+  .tooltip
+    pre
+      text-align: left
+      width: 500px
+      font-size: 10px
+
+
+// Font size tweak for languages that don't fit 
+body[lang='ru']
+  #leaderboard-modal #leaderboard-nav a
+    font-size: 13px
